@@ -1,0 +1,16 @@
+# Android
+app/.gradle/
+app/app/build/
+app/build/
+app/local.properties
+app/*.iml
+app/.idea/
+app/captures/
+app/app/release/
+
+# Arduino
+firmware/build/
+*.hex
+
+# OS
+.DS_Store

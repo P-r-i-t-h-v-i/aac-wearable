@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.AacCalibrator" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#3D5AFE</item>
+        <item name="colorPrimaryDark">#0031CA</item>
+        <item name="colorAccent">#00C853</item>
+    </style>
+</resources>
