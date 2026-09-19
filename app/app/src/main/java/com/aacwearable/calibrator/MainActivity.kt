@@ -170,7 +170,10 @@ class MainActivity : AppCompatActivity() {
                     connectionStatus.text = "Connected - discovering services..."
                     connectionStatus.setTextColor(0xFFFF6D00.toInt())
                 }
-                checkPermAnd { gatt.discoverServices() }
+                // Default BLE ATT MTU is 23 bytes (20 usable), which truncates our
+                // status notifications. Request a larger MTU before discovering
+                // services; onMtuChanged (below) continues from there either way.
+                checkPermAnd { gatt.requestMtu(247) }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 runOnUiThread {
                     connectionStatus.text = "Disconnected"
@@ -181,6 +184,15 @@ class MainActivity : AppCompatActivity() {
                 bluetoothGatt = null
                 commandChar = null
             }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                log("MTU negotiated: $mtu bytes")
+            } else {
+                log("MTU negotiation failed, continuing with default (status $status)")
+            }
+            checkPermAnd { gatt.discoverServices() }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
