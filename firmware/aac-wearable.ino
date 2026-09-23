@@ -1,9 +1,7 @@
 #include <LSM6DS3.h>
 #include <Wire.h>
 #include <ArduinoBLE.h>
-#include "audio_chest.h"
-#include "audio_head.h"
-#include "audio_stomach.h"
+#include "FlashIAP.h"
 
 // Initialize internal IMU on Wire1 (0x6A)
 LSM6DS3 myIMU(I2C_MODE, 0x6A);
@@ -11,33 +9,82 @@ LSM6DS3 myIMU(I2C_MODE, 0x6A);
 #define PIN_AMP_SD   D3
 #define PIN_LED_BLUE LED_BUILTIN
 
-enum BodyPose { POSE_REST = 0, POSE_HEAD = 1, POSE_CHEST = 2, POSE_STOMACH = 3 };
-int16_t g_testAmplitude = 32767; // adjustable via "V,<0-32767>" for audio debugging
+// =========================================================
+// COMMUNICATION MESSAGES
+// Pain and Seizure keep dedicated always-on detectors (double tap /
+// sustained shake). The other five are matched against motion templates
+// the caregiver records, so each one is whatever movement they choose.
+// =========================================================
+enum MsgId {
+  MSG_PAIN = 0, MSG_HUNGER = 1, MSG_TOILET = 2, MSG_SLEEP = 3,
+  MSG_SEIZURE = 4, MSG_YES = 5, MSG_NO = 6
+};
+#define MSG_COUNT 7
 
-BodyPose currentPose = POSE_REST;
-BodyPose lastConfirmedPose = POSE_REST;
+const char* MSG_NAMES[MSG_COUNT] = {
+  "PAIN", "HUNGER", "TOILET", "SLEEP", "SEIZURE", "YES", "NO"
+};
 
-unsigned long poseStartTime = 0;
-const unsigned long DWELL_TIME_MS = 350;
-bool announcementMade = false;
+// Slots driven by recorded templates (Pain/Seizure use fixed detectors)
+bool isTemplateSlot(int id) {
+  return id != MSG_PAIN && id != MSG_SEIZURE;
+}
 
 // =========================================================
-// EMERGENCY SHAKE DETECTION VARIABLES (Seizure Alert)
+// FLASH STORAGE MAP
+// App region is 0x27000..0xED000. The sketch lives at the bottom; voice
+// clips and gesture templates are reserved at the top. Keep the compiled
+// sketch under AUDIO_BASE_ADDR or it will collide with stored clips.
+// =========================================================
+#define AUDIO_BASE_ADDR     0xA0000
+#define AUDIO_SLOT_SIZE     40960        // 10 x 4KB pages, 2.5s @ 8kHz PCM16
+#define AUDIO_HEADER_BYTES  8
+#define AUDIO_MAGIC         0xA1C0DE01
+#define AUDIO_MAX_SAMPLES   ((AUDIO_SLOT_SIZE - AUDIO_HEADER_BYTES) / 2)
+
+#define TEMPLATE_ADDR       0xE6000      // single 4KB page holds all templates
+#define TEMPLATE_MAGIC      0x6E5701
+
+mbed::FlashIAP g_flash;
+bool g_flashReady = false;
+
+// =========================================================
+// GESTURE TEMPLATES
+// 64 samples @ 50Hz = 1.28s of 6-axis motion, z-normalized per axis.
+// =========================================================
+#define GEST_LEN   64
+#define GEST_AXES  6
+#define GEST_BAND  8     // Sakoe-Chiba band for DTW
+
+struct GestureTemplate {
+  uint32_t magic;
+  int16_t data[GEST_LEN * GEST_AXES];
+};
+
+GestureTemplate g_templates[MSG_COUNT];
+float g_gestureThreshold = 3.0;          // tune via "GT,<value>"
+
+// Live gesture capture state
+bool  g_capturing = false;
+int   g_captureIdx = 0;
+int16_t g_captureBuf[GEST_LEN * GEST_AXES];
+unsigned long g_lastTriggerTime = 0;
+const unsigned long GESTURE_COOLDOWN_MS = 2000;
+const float GESTURE_TRIGGER_DPS = 120.0;  // motion energy needed to start capture
+
+int16_t g_testAmplitude = 32767;
+
+// =========================================================
+// PAIN (DOUBLE TAP) + SEIZURE (SHAKE) DETECTORS
 // =========================================================
 unsigned long shakeStartTime = 0;
 unsigned long lastShakeTime = 0;
 const float SHAKE_THRESHOLD_DPS = 300.0;
 const unsigned long REQUIRED_SHAKE_DURATION_MS = 3000;
 
-// =========================================================
-// PAIN DETECTION (DOUBLE BANG/TAP) VARIABLES
-// =========================================================
-bool painModeArmed = false;
 int tapCount = 0;
 unsigned long lastTapTime = 0;
-unsigned long painArmedTime = 0;
-const float TAP_THRESHOLD_G = 2.5; // A hard bang exceeds 2.5g
-const unsigned long PAIN_ARM_DURATION = 5000; // You have 5 seconds to point after double tap
+const float TAP_THRESHOLD_G = 2.5;
 
 // Audio Buffer
 #define AUDIO_BUF_SIZE 1024
@@ -45,44 +92,23 @@ uint32_t i2s_buf_0[AUDIO_BUF_SIZE];
 uint32_t i2s_buf_1[AUDIO_BUF_SIZE];
 
 // =========================================================
-// DYNAMIC CENTROID CLUSTERING
-// =========================================================
-// Each pose is stored as a normalized 3-axis gravity vector (full IMU
-// orientation) rather than derived pitch/roll angles, which discard the
-// third axis and wrap discontinuously at +/-180 degrees.
-struct PoseCentroid {
-  String name;
-  float ax;
-  float ay;
-  float az;
-};
-
-PoseCentroid centroids[4] = {
-  {"REST",     0.33,  -0.07,  0.94},
-  {"HEAD",    -0.28,   0.09,  0.96},
-  {"CHEST",    0.58,   0.79,  0.17},
-  {"STOMACH",  0.23,   0.88,  0.41}
-};
-
-// Distance between unit vectors: d = 2*sin(angle/2).
-// 0.45 corresponds to roughly 26 degrees of tolerance.
-const float DETECTION_RADIUS = 0.45;
-
-void normalizeVector(float &x, float &y, float &z) {
-  float mag = sqrt(x * x + y * y + z * z);
-  if (mag > 0.0001) {
-    x /= mag;
-    y /= mag;
-    z /= mag;
-  }
-}
-
-// =========================================================
-// BLE CALIBRATION SERVICE
+// BLE SERVICE
 // =========================================================
 BLEService calService("a5e7c000-9c3f-4a4e-8e1e-1a2b3c4d5e00");
 BLEStringCharacteristic commandChar("a5e7c000-9c3f-4a4e-8e1e-1a2b3c4d5e01", BLEWrite, 32);
 BLEStringCharacteristic statusChar("a5e7c000-9c3f-4a4e-8e1e-1a2b3c4d5e02", BLERead | BLENotify, 200);
+BLECharacteristic audioChar("a5e7c000-9c3f-4a4e-8e1e-1a2b3c4d5e03", BLEWriteWithoutResponse, 244);
+
+// Audio upload state
+bool     g_uploading = false;
+int      g_uploadSlot = -1;
+uint32_t g_uploadExpected = 0;
+uint32_t g_uploadReceived = 0;
+uint32_t g_uploadWriteAddr = 0;
+uint8_t  g_uploadBuf[4096];
+uint32_t g_uploadBufLen = 0;
+unsigned long g_uploadLastChunk = 0;
+const unsigned long UPLOAD_TIMEOUT_MS = 10000;
 
 void logStatus(const String &msg) {
   Serial.println(msg);
@@ -111,6 +137,13 @@ void setup() {
 
   initDirectI2S();
 
+  if (g_flash.init() == 0) {
+    g_flashReady = true;
+  } else {
+    Serial.println("[ERROR] Flash init failed - recordings unavailable");
+  }
+  loadTemplates();
+
   if (!BLE.begin()) {
     Serial.println("[ERROR] BLE init failed!");
   } else {
@@ -118,98 +151,48 @@ void setup() {
     BLE.setAdvertisedService(calService);
     calService.addCharacteristic(commandChar);
     calService.addCharacteristic(statusChar);
+    calService.addCharacteristic(audioChar);
     BLE.addService(calService);
     statusChar.writeValue("READY");
     BLE.advertise();
   }
 
   Serial.println("\n==================================================");
-  Serial.println("  DYNAMIC AAC ANNOUNCER ACTIVE");
-  Serial.println("  * Pose Engine Running");
-  Serial.println("  * Seizure Shake Detection Active (3+ seconds)");
-  Serial.println("  * Pain Detection Active (Double Bang Table -> Point)");
-  Serial.println("  * BLE Calibration Service Advertising");
+  Serial.println("  GESTURE AAC WRISTBAND ACTIVE");
+  Serial.println("  * 7 messages: PAIN HUNGER TOILET SLEEP");
+  Serial.println("                SEIZURE YES NO");
+  Serial.println("  * Pain = two taps | Seizure = shake 3s");
+  Serial.println("  * Others = recorded motion templates");
+  Serial.println("  * BLE service advertising");
   Serial.println("==================================================");
-}
-
-void handleCommand(String input) {
-  input.trim();
-  if (input.length() == 0) return;
-
-  int id; float vx, vy, vz;
-  if (sscanf(input.c_str(), "%d,%f,%f,%f", &id, &vx, &vy, &vz) == 4) {
-    if (id >= 0 && id <= 3) {
-      normalizeVector(vx, vy, vz);
-      centroids[id].ax = vx;
-      centroids[id].ay = vy;
-      centroids[id].az = vz;
-      logStatus("[SUCCESS] Updated " + centroids[id].name + " -> X:" + String(vx, 3) +
-                " Y:" + String(vy, 3) + " Z:" + String(vz, 3));
-    }
-  } else if (input == "H") {
-    logStatus("[TEST] Playing HEAD tone");
-    speakPose(POSE_HEAD);
-  } else if (input == "C") {
-    logStatus("[TEST] Playing CHEST tone");
-    speakPose(POSE_CHEST);
-  } else if (input == "S") {
-    logStatus("[TEST] Playing STOMACH tone");
-    speakPose(POSE_STOMACH);
-  } else if (input == "P1") {
-    logStatus("[TEST] Playing PAIN alarm (HEAD)");
-    triggerPainAlarm(POSE_HEAD);
-  } else if (input == "P2") {
-    logStatus("[TEST] Playing PAIN alarm (CHEST)");
-    triggerPainAlarm(POSE_CHEST);
-  } else if (input == "P3") {
-    logStatus("[TEST] Playing PAIN alarm (STOMACH)");
-    triggerPainAlarm(POSE_STOMACH);
-  } else if (input == "E") {
-    logStatus("[TEST] Playing EMERGENCY/SEIZURE alarm");
-    triggerEmergencyAlarm();
-  } else if (input == "CAL") {
-    calibrateCurrentPosition();
-  } else if (input == "CAL0") {
-    calibratePose(POSE_REST);
-  } else if (input == "CAL1") {
-    calibratePose(POSE_HEAD);
-  } else if (input == "CAL2") {
-    calibratePose(POSE_CHEST);
-  } else if (input == "CAL3") {
-    calibratePose(POSE_STOMACH);
-  } else if (input == "SHOW") {
-    showCentroids();
-  } else if (input == "T") {
-    logStatus("[TEST] Playing 440Hz test tone at amplitude " + String(g_testAmplitude));
-    digitalWrite(PIN_AMP_SD, HIGH);
-    digitalWrite(PIN_LED_BLUE, LOW);
-    delay(50);
-    playToneI2S(440, 1000);
-    digitalWrite(PIN_AMP_SD, LOW);
-    digitalWrite(PIN_LED_BLUE, HIGH);
-  } else {
-    int v;
-    if (sscanf(input.c_str(), "V,%d", &v) == 1) {
-      g_testAmplitude = constrain(v, 0, 32767);
-      logStatus("[SUCCESS] Test amplitude set to " + String(g_testAmplitude));
-    }
-  }
 }
 
 void loop() {
   BLE.poll();
 
-  // 1. Check for commands via USB Serial
   if (Serial.available() > 0) {
     handleCommand(Serial.readStringUntil('\n'));
   }
-
-  // 1b. Check for commands via BLE
   if (commandChar.written()) {
     handleCommand(commandChar.value());
   }
+  if (audioChar.written()) {
+    receiveAudioChunk(audioChar.value(), audioChar.valueLength());
+  }
 
-  // 2. Read IMU Data
+  // Suspend gesture processing while a clip is uploading. A dropped BLE
+  // connection mid-transfer would otherwise wedge the device here.
+  if (g_uploading) {
+    if (millis() - g_uploadLastChunk > UPLOAD_TIMEOUT_MS) {
+      g_uploading = false;
+      g_uploadSlot = -1;
+      g_uploadBufLen = 0;
+      logStatus("[UP] ABORTED - timed out waiting for data");
+    }
+    delay(2);
+    return;
+  }
+
   float ax = myIMU.readFloatAccelX();
   float ay = myIMU.readFloatAccelY();
   float az = myIMU.readFloatAccelZ();
@@ -217,153 +200,384 @@ void loop() {
   float gy = myIMU.readFloatGyroY();
   float gz = myIMU.readFloatGyroZ();
 
-  // 3. PAIN DETECTION (DOUBLE BANG/TAP) LOGIC
+  // --- PAIN: two sharp taps ---
   float accel_magnitude = sqrt(ax*ax + ay*ay + az*az);
-
   if (accel_magnitude > TAP_THRESHOLD_G) {
-    if (millis() - lastTapTime > 250) { // 250ms debounce to prevent false multi-taps
+    if (millis() - lastTapTime > 250) {
       tapCount++;
       lastTapTime = millis();
-      Serial.print("[*] Bang detected! Count: "); Serial.println(tapCount);
-
       if (tapCount == 2) {
-        painModeArmed = true;
-        painArmedTime = millis();
         tapCount = 0;
-        Serial.println("\n[!] PAIN MODE ARMED. Point to body part now...");
+        playMessage(MSG_PAIN);
+        g_lastTriggerTime = millis();
+        return;
       }
     }
   }
-
-  // Timeout: if they bang once but wait too long (>1.5s) for the second bang
   if (tapCount == 1 && (millis() - lastTapTime > 1500)) {
     tapCount = 0;
   }
 
-  // Timeout: if they double bang but wait too long (>5s) to point to a body part
-  if (painModeArmed && (millis() - painArmedTime > PAIN_ARM_DURATION)) {
-    painModeArmed = false;
-    Serial.println("[*] Pain mode timed out. Returned to normal.");
-  }
-
-  // 4. EMERGENCY SHAKE DETECTION LOGIC
+  // --- SEIZURE: sustained vigorous shaking ---
   float gyro_magnitude = abs(gx) + abs(gy) + abs(gz);
   if (gyro_magnitude > SHAKE_THRESHOLD_DPS) {
     if (shakeStartTime == 0) {
       shakeStartTime = millis();
-      Serial.println("\n[!] WARNING: SHAKING DETECTED...");
     }
     lastShakeTime = millis();
   }
-
   if (shakeStartTime > 0 && (millis() - lastShakeTime > 500)) {
     shakeStartTime = 0;
   }
-
   if (shakeStartTime > 0 && (millis() - shakeStartTime > REQUIRED_SHAKE_DURATION_MS)) {
-    triggerEmergencyAlarm();
     shakeStartTime = 0;
-    poseStartTime = millis();
+    playMessage(MSG_SEIZURE);
+    g_lastTriggerTime = millis();
     return;
   }
 
-  // 5 & 6. Classify using the full 3-axis gravity vector
-  BodyPose detectedPose = classifyPoseNearestNeighbor(ax, ay, az);
+  // --- TEMPLATE GESTURES ---
+  if (g_capturing) {
+    int base = g_captureIdx * GEST_AXES;
+    g_captureBuf[base + 0] = (int16_t)(ax * 1000);
+    g_captureBuf[base + 1] = (int16_t)(ay * 1000);
+    g_captureBuf[base + 2] = (int16_t)(az * 1000);
+    g_captureBuf[base + 3] = (int16_t)gx;
+    g_captureBuf[base + 4] = (int16_t)gy;
+    g_captureBuf[base + 5] = (int16_t)gz;
+    g_captureIdx++;
 
-  // 7. Dwell Filter & Trigger
-  if (detectedPose == currentPose) {
-    if ((millis() - poseStartTime >= DWELL_TIME_MS) && !announcementMade && shakeStartTime == 0) {
-      if (detectedPose != POSE_REST) {
-
-        // CHECK IF PAIN MODE WAS ARMED BY A DOUBLE BANG
-        if (painModeArmed) {
-          triggerPainAlarm(detectedPose);
-          painModeArmed = false; // Disarm after alarming
-        } else {
-          speakPose(detectedPose); // Normal behavior
-        }
-
-        announcementMade = true;
-        lastConfirmedPose = detectedPose;
+    if (g_captureIdx >= GEST_LEN) {
+      g_capturing = false;
+      digitalWrite(PIN_LED_BLUE, HIGH);
+      int match = matchGesture();
+      if (match >= 0) {
+        playMessage(match);
+        g_lastTriggerTime = millis();
       }
     }
   } else {
-    currentPose = detectedPose;
-    poseStartTime = millis();
-    if (detectedPose == POSE_REST) announcementMade = false;
+    bool cooling = (millis() - g_lastTriggerTime) < GESTURE_COOLDOWN_MS;
+    if (!cooling && shakeStartTime == 0 && gyro_magnitude > GESTURE_TRIGGER_DPS) {
+      g_capturing = true;
+      g_captureIdx = 0;
+      digitalWrite(PIN_LED_BLUE, LOW);
+    }
   }
 
   delay(20);
 }
 
-// ---------------------------------------------------------
-// Pain Alarm Trigger (5 Second Continuous Beep)
-// ---------------------------------------------------------
-void triggerPainAlarm(BodyPose pose) {
-  Serial.println("\n************************************************");
-  Serial.print("!!! PAIN DETECTED IN: ");
-  if (pose == POSE_HEAD) Serial.print("HEAD");
-  if (pose == POSE_CHEST) Serial.print("CHEST");
-  if (pose == POSE_STOMACH) Serial.print("STOMACH");
-  Serial.println(" !!!");
-  Serial.println("************************************************\n");
+// =========================================================
+// COMMAND DISPATCH (shared by USB serial and BLE)
+// =========================================================
+void handleCommand(String input) {
+  input.trim();
+  if (input.length() == 0) return;
 
-  digitalWrite(PIN_AMP_SD, HIGH);
-  digitalWrite(PIN_LED_BLUE, LOW);
-  delay(50);
+  int slot; long bytes; float f;
 
-  // Play a loud, continuous 5-second long beep
-  playToneI2S(1200, 5000);
-
-  digitalWrite(PIN_AMP_SD, LOW);
-  digitalWrite(PIN_LED_BLUE, HIGH);
+  if (input == "LIST") {
+    listMessages();
+  } else if (sscanf(input.c_str(), "RECG,%d", &slot) == 1) {
+    recordGesture(slot);
+  } else if (sscanf(input.c_str(), "AUDIO,%d,%ld", &slot, &bytes) == 2) {
+    beginAudioUpload(slot, (uint32_t)bytes);
+  } else if (input == "AUDIOEND") {
+    finishAudioUpload();
+  } else if (sscanf(input.c_str(), "PLAY,%d", &slot) == 1) {
+    if (slot >= 0 && slot < MSG_COUNT) playMessage(slot);
+  } else if (sscanf(input.c_str(), "DEL,%d", &slot) == 1) {
+    deleteMessage(slot);
+  } else if (sscanf(input.c_str(), "GT,%f", &f) == 1) {
+    g_gestureThreshold = f;
+    logStatus("[OK] Gesture threshold = " + String(g_gestureThreshold, 2));
+  } else if (sscanf(input.c_str(), "V,%d", &slot) == 1) {
+    g_testAmplitude = constrain(slot, 0, 32767);
+    logStatus("[OK] Test amplitude = " + String(g_testAmplitude));
+  } else if (input == "T") {
+    ampOn();
+    playToneI2S(440, 1000);
+    ampOff();
+  } else if (input == "E") {
+    playMessage(MSG_SEIZURE);
+  }
 }
 
-// ---------------------------------------------------------
-// Seizure Alarm Trigger
-// ---------------------------------------------------------
-void triggerEmergencyAlarm() {
-  Serial.println("\n************************************************");
-  Serial.println("!!! EMERGENCY DISTRESS / SEIZURE TRIGGERED !!!");
-  Serial.println("************************************************\n");
+void listMessages() {
+  for (int i = 0; i < MSG_COUNT; i++) {
+    String line = String(i) + " " + MSG_NAMES[i];
+    line += audioLength(i) > 0 ? " voice:YES" : " voice:--";
+    if (isTemplateSlot(i)) {
+      line += g_templates[i].magic == TEMPLATE_MAGIC ? " gesture:YES" : " gesture:--";
+    } else {
+      line += (i == MSG_PAIN) ? " gesture:2-TAP" : " gesture:SHAKE";
+    }
+    logStatus(line);
+  }
+}
 
-  digitalWrite(PIN_AMP_SD, HIGH);
-  digitalWrite(PIN_LED_BLUE, LOW);
-  delay(50);
-
-  for (int i = 0; i < 6; i++) {
-    playToneI2S(1400, 400);
-    playToneI2S(900, 400);
+// =========================================================
+// GESTURE RECORDING + MATCHING
+// =========================================================
+void recordGesture(int slot) {
+  if (slot < 0 || slot >= MSG_COUNT || !isTemplateSlot(slot)) {
+    logStatus("[ERROR] Slot has a fixed gesture (tap/shake)");
+    return;
   }
 
-  digitalWrite(PIN_AMP_SD, LOW);
-  digitalWrite(PIN_LED_BLUE, HIGH);
-}
+  logStatus(String("[REC] ") + MSG_NAMES[slot] + " gesture in 2s...");
+  delay(2000);
+  calibrateBeep(1);
+  logStatus("[REC] Perform the movement now (1.3s)");
+  digitalWrite(PIN_LED_BLUE, LOW);
 
-// ---------------------------------------------------------
-// Calibration Helpers
-// ---------------------------------------------------------
-void calibrateCurrentPosition() {
-  logStatus("[CAL] Hold still... sampling for 3 seconds");
-
-  const int SAMPLES = 150;
-  float sum_x = 0, sum_y = 0, sum_z = 0;
-
-  for (int i = 0; i < SAMPLES; i++) {
-    sum_x += myIMU.readFloatAccelX();
-    sum_y += myIMU.readFloatAccelY();
-    sum_z += myIMU.readFloatAccelZ();
+  for (int i = 0; i < GEST_LEN; i++) {
+    int base = i * GEST_AXES;
+    g_templates[slot].data[base + 0] = (int16_t)(myIMU.readFloatAccelX() * 1000);
+    g_templates[slot].data[base + 1] = (int16_t)(myIMU.readFloatAccelY() * 1000);
+    g_templates[slot].data[base + 2] = (int16_t)(myIMU.readFloatAccelZ() * 1000);
+    g_templates[slot].data[base + 3] = (int16_t)myIMU.readFloatGyroX();
+    g_templates[slot].data[base + 4] = (int16_t)myIMU.readFloatGyroY();
+    g_templates[slot].data[base + 5] = (int16_t)myIMU.readFloatGyroZ();
     delay(20);
   }
+  g_templates[slot].magic = TEMPLATE_MAGIC;
 
-  float ax = sum_x / SAMPLES;
-  float ay = sum_y / SAMPLES;
-  float az = sum_z / SAMPLES;
-  normalizeVector(ax, ay, az);
+  digitalWrite(PIN_LED_BLUE, HIGH);
+  calibrateBeep(2);
+  saveTemplates();
+  logStatus(String("[REC] SAVED gesture for ") + MSG_NAMES[slot]);
+}
 
-  BodyPose match = classifyPoseNearestNeighbor(ax, ay, az);
-  logStatus("[CAL] X:" + String(ax, 3) + " Y:" + String(ay, 3) + " Z:" + String(az, 3) +
-            " -> classifies as: " + centroids[(int)match].name);
+// Z-normalize each axis so matching is about motion shape, not amplitude.
+void normalizeWindow(const int16_t* src, float* dst) {
+  for (int a = 0; a < GEST_AXES; a++) {
+    float mean = 0;
+    for (int i = 0; i < GEST_LEN; i++) mean += src[i * GEST_AXES + a];
+    mean /= GEST_LEN;
+
+    float var = 0;
+    for (int i = 0; i < GEST_LEN; i++) {
+      float d = src[i * GEST_AXES + a] - mean;
+      var += d * d;
+    }
+    float sd = sqrt(var / GEST_LEN);
+    if (sd < 1.0) sd = 1.0;
+
+    for (int i = 0; i < GEST_LEN; i++) {
+      dst[i * GEST_AXES + a] = (src[i * GEST_AXES + a] - mean) / sd;
+    }
+  }
+}
+
+// Banded DTW; returns mean per-step distance.
+float dtwDistance(const float* a, const float* b) {
+  static float prev[GEST_LEN];
+  static float curr[GEST_LEN];
+
+  for (int j = 0; j < GEST_LEN; j++) prev[j] = 1e9;
+  prev[0] = 0;
+
+  for (int i = 1; i < GEST_LEN; i++) {
+    for (int j = 0; j < GEST_LEN; j++) curr[j] = 1e9;
+
+    int lo = max(1, i - GEST_BAND);
+    int hi = min(GEST_LEN - 1, i + GEST_BAND);
+
+    for (int j = lo; j <= hi; j++) {
+      float cost = 0;
+      for (int k = 0; k < GEST_AXES; k++) {
+        float d = a[i * GEST_AXES + k] - b[j * GEST_AXES + k];
+        cost += d * d;
+      }
+      cost = sqrt(cost);
+
+      float best = prev[j];
+      if (prev[j - 1] < best) best = prev[j - 1];
+      if (curr[j - 1] < best) best = curr[j - 1];
+      curr[j] = cost + best;
+    }
+    for (int j = 0; j < GEST_LEN; j++) prev[j] = curr[j];
+  }
+  return prev[GEST_LEN - 1] / GEST_LEN;
+}
+
+int matchGesture() {
+  static float liveNorm[GEST_LEN * GEST_AXES];
+  static float tmplNorm[GEST_LEN * GEST_AXES];
+
+  normalizeWindow(g_captureBuf, liveNorm);
+
+  int bestSlot = -1;
+  float bestDist = 1e9;
+
+  for (int i = 0; i < MSG_COUNT; i++) {
+    if (!isTemplateSlot(i) || g_templates[i].magic != TEMPLATE_MAGIC) continue;
+    normalizeWindow(g_templates[i].data, tmplNorm);
+    float d = dtwDistance(liveNorm, tmplNorm);
+    if (d < bestDist) {
+      bestDist = d;
+      bestSlot = i;
+    }
+  }
+
+  if (bestSlot >= 0) {
+    logStatus(String("[GESTURE] best=") + MSG_NAMES[bestSlot] +
+              " dist=" + String(bestDist, 2) +
+              (bestDist <= g_gestureThreshold ? " MATCH" : " (no match)"));
+    if (bestDist <= g_gestureThreshold) return bestSlot;
+  }
+  return -1;
+}
+
+// =========================================================
+// FLASH: TEMPLATES
+// =========================================================
+void loadTemplates() {
+  if (!g_flashReady) return;
+  for (int i = 0; i < MSG_COUNT; i++) g_templates[i].magic = 0;
+
+  const uint8_t* p = (const uint8_t*)TEMPLATE_ADDR;
+  for (int i = 0; i < MSG_COUNT; i++) {
+    const GestureTemplate* t = (const GestureTemplate*)(p + i * sizeof(GestureTemplate));
+    if (t->magic == TEMPLATE_MAGIC) {
+      memcpy(&g_templates[i], t, sizeof(GestureTemplate));
+    }
+  }
+}
+
+void saveTemplates() {
+  if (!g_flashReady) return;
+  uint32_t sector = g_flash.get_sector_size(TEMPLATE_ADDR);
+  if (g_flash.erase(TEMPLATE_ADDR, sector) != 0) {
+    logStatus("[ERROR] template erase failed");
+    return;
+  }
+  uint32_t total = sizeof(GestureTemplate) * MSG_COUNT;
+  if (g_flash.program(g_templates, TEMPLATE_ADDR, total) != 0) {
+    logStatus("[ERROR] template write failed");
+  }
+}
+
+// =========================================================
+// FLASH: VOICE CLIPS
+// =========================================================
+uint32_t slotAddr(int slot) {
+  return AUDIO_BASE_ADDR + (uint32_t)slot * AUDIO_SLOT_SIZE;
+}
+
+uint32_t audioLength(int slot) {
+  if (slot < 0 || slot >= MSG_COUNT) return 0;
+  const uint32_t* hdr = (const uint32_t*)slotAddr(slot);
+  if (hdr[0] != AUDIO_MAGIC) return 0;
+  uint32_t n = hdr[1];
+  return (n > AUDIO_MAX_SAMPLES) ? 0 : n;
+}
+
+void beginAudioUpload(int slot, uint32_t byteCount) {
+  if (!g_flashReady) { logStatus("[ERROR] flash unavailable"); return; }
+  if (slot < 0 || slot >= MSG_COUNT) { logStatus("[ERROR] bad slot"); return; }
+  if (byteCount == 0 || byteCount > (uint32_t)AUDIO_MAX_SAMPLES * 2) {
+    logStatus("[ERROR] clip too long (max 2.5s @ 8kHz)");
+    return;
+  }
+
+  if (g_flash.erase(slotAddr(slot), AUDIO_SLOT_SIZE) != 0) {
+    logStatus("[ERROR] slot erase failed");
+    return;
+  }
+
+  g_uploading = true;
+  g_uploadSlot = slot;
+  g_uploadExpected = byteCount;
+  g_uploadReceived = 0;
+  g_uploadBufLen = 0;
+  g_uploadWriteAddr = slotAddr(slot) + AUDIO_HEADER_BYTES;
+  g_uploadLastChunk = millis();
+
+  logStatus(String("[UP] ") + MSG_NAMES[slot] + " receiving " + String(byteCount) + " bytes");
+}
+
+void receiveAudioChunk(const uint8_t* data, int len) {
+  if (!g_uploading || len <= 0) return;
+  g_uploadLastChunk = millis();
+
+  for (int i = 0; i < len && g_uploadReceived < g_uploadExpected; i++) {
+    g_uploadBuf[g_uploadBufLen++] = data[i];
+    g_uploadReceived++;
+
+    if (g_uploadBufLen == sizeof(g_uploadBuf)) {
+      g_flash.program(g_uploadBuf, g_uploadWriteAddr, g_uploadBufLen);
+      g_uploadWriteAddr += g_uploadBufLen;
+      g_uploadBufLen = 0;
+    }
+  }
+}
+
+void finishAudioUpload() {
+  if (!g_uploading) return;
+
+  if (g_uploadBufLen > 0) {
+    // Flash programming needs a 4-byte aligned length
+    while (g_uploadBufLen % 4 != 0) g_uploadBuf[g_uploadBufLen++] = 0;
+    g_flash.program(g_uploadBuf, g_uploadWriteAddr, g_uploadBufLen);
+    g_uploadBufLen = 0;
+  }
+
+  uint32_t hdr[2] = { AUDIO_MAGIC, g_uploadReceived / 2 };
+  g_flash.program(hdr, slotAddr(g_uploadSlot), sizeof(hdr));
+
+  logStatus(String("[UP] SAVED ") + MSG_NAMES[g_uploadSlot] + " " +
+            String(g_uploadReceived) + "/" + String(g_uploadExpected) + " bytes");
+
+  g_uploading = false;
+  g_uploadSlot = -1;
+}
+
+void deleteMessage(int slot) {
+  if (!g_flashReady || slot < 0 || slot >= MSG_COUNT) return;
+  g_flash.erase(slotAddr(slot), AUDIO_SLOT_SIZE);
+  g_templates[slot].magic = 0;
+  saveTemplates();
+  logStatus(String("[OK] Cleared ") + MSG_NAMES[slot]);
+}
+
+// =========================================================
+// PLAYBACK
+// =========================================================
+void ampOn() {
+  digitalWrite(PIN_AMP_SD, HIGH);
+  digitalWrite(PIN_LED_BLUE, LOW);
+  delay(50);
+}
+
+void ampOff() {
+  digitalWrite(PIN_AMP_SD, LOW);
+  digitalWrite(PIN_LED_BLUE, HIGH);
+}
+
+void playMessage(int slot) {
+  if (slot < 0 || slot >= MSG_COUNT) return;
+  logStatus(String(">>> ") + MSG_NAMES[slot]);
+
+  uint32_t n = audioLength(slot);
+  ampOn();
+  if (n > 0) {
+    // nRF52 flash is memory-mapped, so the clip streams straight from flash
+    const int16_t* pcm = (const int16_t*)(slotAddr(slot) + AUDIO_HEADER_BYTES);
+    playPCMI2S(pcm, n);
+  } else {
+    // No recording yet - fall back to an alert pattern so it still signals
+    if (slot == MSG_SEIZURE) {
+      for (int i = 0; i < 6; i++) { playToneI2S(1400, 400); playToneI2S(900, 400); }
+    } else if (slot == MSG_PAIN) {
+      playToneI2S(1200, 2000);
+    } else {
+      for (int i = 0; i <= slot; i++) { playToneI2S(1000, 150); delay(100); }
+    }
+  }
+  ampOff();
 }
 
 void calibrateBeep(int count) {
@@ -376,126 +590,9 @@ void calibrateBeep(int count) {
   digitalWrite(PIN_AMP_SD, LOW);
 }
 
-void calibratePose(BodyPose pose) {
-  int id = (int)pose;
-
-  logStatus("[CAL] Get into position for " + centroids[id].name + " - starting in 2 seconds...");
-  delay(2000);
-
-  calibrateBeep(1);   // one beep = hold still, sampling now
-  logStatus("[CAL] Sampling for 5 seconds - HOLD STILL");
-  digitalWrite(PIN_LED_BLUE, LOW);
-
-  const int SAMPLES = 250;   // 250 x 20ms = 5 seconds
-  float sum_x = 0, sum_y = 0, sum_z = 0;
-
-  for (int i = 0; i < SAMPLES; i++) {
-    sum_x += myIMU.readFloatAccelX();
-    sum_y += myIMU.readFloatAccelY();
-    sum_z += myIMU.readFloatAccelZ();
-    delay(20);
-  }
-
-  float ax = sum_x / SAMPLES;
-  float ay = sum_y / SAMPLES;
-  float az = sum_z / SAMPLES;
-  normalizeVector(ax, ay, az);
-
-  centroids[id].ax = ax;
-  centroids[id].ay = ay;
-  centroids[id].az = az;
-
-  digitalWrite(PIN_LED_BLUE, HIGH);
-  calibrateBeep(2);   // two beeps = done
-
-  logStatus("[CAL] SAVED " + centroids[id].name + " -> X:" + String(ax, 3) +
-            " Y:" + String(ay, 3) + " Z:" + String(az, 3));
-
-  // Warn if this position is too close to an already-calibrated one to
-  // be told apart reliably.
-  for (int i = 0; i < 4; i++) {
-    if (i == id) continue;
-    float dx = ax - centroids[i].ax;
-    float dy = ay - centroids[i].ay;
-    float dz = az - centroids[i].az;
-    float d = sqrt(dx * dx + dy * dy + dz * dz);
-    if (d < DETECTION_RADIUS) {
-      logStatus("[CAL] WARNING: too close to " + centroids[i].name + " (distance " +
-                String(d, 3) + ", need > " + String(DETECTION_RADIUS, 2) +
-                "). Tilt it differently at this spot.");
-    }
-  }
-}
-
-void showCentroids() {
-  Serial.println("\n[INFO] Current pose targets:");
-  for (int i = 0; i < 4; i++) {
-    String line = String(i) + " " + centroids[i].name + " -> X:" + String(centroids[i].ax, 3) +
-                  " Y:" + String(centroids[i].ay, 3) + " Z:" + String(centroids[i].az, 3);
-    logStatus(line);
-  }
-  logStatus("Detection radius: " + String(DETECTION_RADIUS, 2));
-}
-
-// ---------------------------------------------------------
-// Nearest Neighbor Classification Algorithm
-// ---------------------------------------------------------
-BodyPose classifyPoseNearestNeighbor(float ax, float ay, float az) {
-  normalizeVector(ax, ay, az);
-
-  float min_distance = 100000.0;
-  int closest_id = 0;
-
-  for (int i = 0; i < 4; i++) {
-    float dx = ax - centroids[i].ax;
-    float dy = ay - centroids[i].ay;
-    float dz = az - centroids[i].az;
-    float distance = sqrt((dx * dx) + (dy * dy) + (dz * dz));
-
-    if (distance < min_distance) {
-      min_distance = distance;
-      closest_id = i;
-    }
-  }
-
-  if (min_distance < DETECTION_RADIUS) {
-    return (BodyPose)closest_id;
-  }
-  return POSE_REST;
-}
-
-// ---------------------------------------------------------
-// Normal Audio Trigger
-// ---------------------------------------------------------
-void speakPose(BodyPose pose) {
-  digitalWrite(PIN_AMP_SD, HIGH);
-  digitalWrite(PIN_LED_BLUE, LOW);
-  delay(50);
-
-  switch (pose) {
-    case POSE_HEAD:
-      Serial.println("\n>>> [SPEECH OUTPUT]: \"HEAD\"");
-      playPCMI2S(HEAD_PCM, HEAD_PCM_LEN);
-      break;
-    case POSE_CHEST:
-      Serial.println("\n>>> [SPEECH OUTPUT]: \"CHEST\"");
-      playPCMI2S(CHEST_PCM, CHEST_PCM_LEN);
-      break;
-    case POSE_STOMACH:
-      Serial.println("\n>>> [SPEECH OUTPUT]: \"STOMACH\"");
-      playPCMI2S(STOMACH_PCM, STOMACH_PCM_LEN);
-      break;
-    default:
-      break;
-  }
-
-  digitalWrite(PIN_AMP_SD, LOW);
-  digitalWrite(PIN_LED_BLUE, HIGH);
-}
-
-// ---------------------------------------------------------
-// DIRECT HARDWARE I2S DMA
-// ---------------------------------------------------------
+// =========================================================
+// DIRECT HARDWARE I2S DMA (8 kHz)
+// =========================================================
 void initDirectI2S() {
   NRF_I2S->ENABLE = 0;
   NRF_I2S->PSEL.MCK   = 0xFFFFFFFF;
@@ -509,7 +606,8 @@ void initDirectI2S() {
   NRF_I2S->CONFIG.TXEN      = (I2S_CONFIG_TXEN_TXEN_Enabled << I2S_CONFIG_TXEN_TXEN_Pos);
   NRF_I2S->CONFIG.MCKEN     = (I2S_CONFIG_MCKEN_MCKEN_Enabled << I2S_CONFIG_MCKEN_MCKEN_Pos);
   NRF_I2S->CONFIG.MCKFREQ   = (I2S_CONFIG_MCKFREQ_MCKFREQ_32MDIV63 << I2S_CONFIG_MCKFREQ_MCKFREQ_Pos);
-  NRF_I2S->CONFIG.RATIO     = (I2S_CONFIG_RATIO_RATIO_32X << I2S_CONFIG_RATIO_RATIO_Pos);
+  // 32MHz/63/64 = 7936Hz ~= 8kHz (same 0.8% tolerance the 16kHz setup used)
+  NRF_I2S->CONFIG.RATIO     = (I2S_CONFIG_RATIO_RATIO_64X << I2S_CONFIG_RATIO_RATIO_Pos);
   NRF_I2S->CONFIG.SWIDTH    = (I2S_CONFIG_SWIDTH_SWIDTH_16Bit << I2S_CONFIG_SWIDTH_SWIDTH_Pos);
   NRF_I2S->CONFIG.ALIGN     = (I2S_CONFIG_ALIGN_ALIGN_Left << I2S_CONFIG_ALIGN_ALIGN_Pos);
   NRF_I2S->CONFIG.FORMAT    = (I2S_CONFIG_FORMAT_FORMAT_I2S << I2S_CONFIG_FORMAT_FORMAT_Pos);
@@ -519,10 +617,11 @@ void initDirectI2S() {
 }
 
 void playToneI2S(int frequency, int durationMs) {
-  const int sample_rate = 16000;
+  const int sample_rate = 8000;
   int total_samples = (sample_rate * durationMs) / 1000;
   int sample_idx = 0;
   int period = sample_rate / frequency;
+  if (period < 2) period = 2;
 
   const int16_t AMPLITUDE = g_testAmplitude;
 
@@ -556,9 +655,6 @@ void playToneI2S(int frequency, int durationMs) {
   NRF_I2S->TASKS_STOP = 1;
 }
 
-// ---------------------------------------------------------
-// PCM Sample Playback over I2S (spoken words)
-// ---------------------------------------------------------
 void playPCMI2S(const int16_t* samples, uint32_t total_samples) {
   uint32_t sample_idx = 0;
 
