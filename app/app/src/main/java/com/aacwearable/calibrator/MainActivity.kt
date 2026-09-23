@@ -66,6 +66,7 @@ class MainActivity : AppCompatActivity() {
     private var uploadChunks: List<ByteArray> = emptyList()
     private var uploadIndex = 0
     private var uploading = false
+    private var awaitingEraseDone = false
 
     // Recording state
     private var recorder: AudioRecord? = null
@@ -251,13 +252,23 @@ class MainActivity : AppCompatActivity() {
         uploadChunks = pcm.asIterable().chunked(chunkSize) { it.toByteArray() }
         uploadIndex = 0
         uploading = true
+        awaitingEraseDone = true
 
         uploadProgress.visibility = View.VISIBLE
         uploadProgress.progress = 0
 
         sendCommand("AUDIO,$slot,${pcm.size}")
-        // Give the firmware time to erase the slot before data starts arriving
-        mainHandler.postDelayed({ sendNextChunk() }, 600)
+        // The device erases its flash slot one page at a time (each ~85ms,
+        // spread across loop() iterations to avoid blocking BLE long enough
+        // to disconnect) and sends "[UP] erased, ready to receive" when done.
+        // Start sending chunks on that signal; the delayed fallback below only
+        // covers a dropped/garbled status notification.
+        mainHandler.postDelayed({
+            if (awaitingEraseDone) {
+                awaitingEraseDone = false
+                sendNextChunk()
+            }
+        }, 3000)
     }
 
     private fun sendNextChunk() {
@@ -444,6 +455,11 @@ class MainActivity : AppCompatActivity() {
             val text = characteristic.getStringValue(0) ?: return
             log(text)
             updateRowFromStatus(text)
+
+            if (awaitingEraseDone && text.contains("erased, ready")) {
+                awaitingEraseDone = false
+                sendNextChunk()
+            }
         }
     }
 

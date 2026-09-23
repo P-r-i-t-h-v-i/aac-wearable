@@ -105,10 +105,20 @@ int      g_uploadSlot = -1;
 uint32_t g_uploadExpected = 0;
 uint32_t g_uploadReceived = 0;
 uint32_t g_uploadWriteAddr = 0;
-uint8_t  g_uploadBuf[4096];
+uint8_t  g_uploadBuf[512];
 uint32_t g_uploadBufLen = 0;
 unsigned long g_uploadLastChunk = 0;
 const unsigned long UPLOAD_TIMEOUT_MS = 10000;
+
+// This board's mbed core has no SoftDevice (TARGET_SOFTDEVICE_NONE) - flash
+// erase/program bangs the NVMC controller directly and disables interrupts
+// for the whole call. A single 40KB slot erase blocks the BLE radio's
+// interrupts for ~850ms (10 pages), long enough to miss connection events
+// and get disconnected. Erasing one page per loop() iteration keeps each
+// blocked window to ~85ms and lets BLE.poll() run in between.
+bool     g_erasing = false;
+uint32_t g_eraseAddr = 0;
+int      g_erasePagesLeft = 0;
 
 void logStatus(const String &msg) {
   Serial.println(msg);
@@ -176,6 +186,23 @@ void loop() {
   if (commandChar.written()) {
     handleCommand(commandChar.value());
   }
+
+  // Erase one flash page per iteration (see g_erasing comment above) so
+  // BLE.poll() runs between pages instead of blocking through all of them.
+  if (g_erasing) {
+    uint32_t sector = g_flash.get_sector_size(g_eraseAddr);
+    g_flash.erase(g_eraseAddr, sector);
+    g_eraseAddr += sector;
+    g_erasePagesLeft--;
+    g_uploadLastChunk = millis();
+
+    if (g_erasePagesLeft <= 0) {
+      g_erasing = false;
+      logStatus("[UP] erased, ready to receive");
+    }
+    return;
+  }
+
   if (audioChar.written()) {
     receiveAudioChunk(audioChar.value(), audioChar.valueLength());
   }
@@ -483,11 +510,6 @@ void beginAudioUpload(int slot, uint32_t byteCount) {
     return;
   }
 
-  if (g_flash.erase(slotAddr(slot), AUDIO_SLOT_SIZE) != 0) {
-    logStatus("[ERROR] slot erase failed");
-    return;
-  }
-
   g_uploading = true;
   g_uploadSlot = slot;
   g_uploadExpected = byteCount;
@@ -496,7 +518,13 @@ void beginAudioUpload(int slot, uint32_t byteCount) {
   g_uploadWriteAddr = slotAddr(slot) + AUDIO_HEADER_BYTES;
   g_uploadLastChunk = millis();
 
-  logStatus(String("[UP] ") + MSG_NAMES[slot] + " receiving " + String(byteCount) + " bytes");
+  // Erase spread across loop() iterations (see g_erasing declaration) -
+  // this call only arms it, the actual erasing happens in loop().
+  g_erasing = true;
+  g_eraseAddr = slotAddr(slot);
+  g_erasePagesLeft = AUDIO_SLOT_SIZE / g_flash.get_sector_size(g_eraseAddr);
+
+  logStatus(String("[UP] ") + MSG_NAMES[slot] + " erasing " + String(g_erasePagesLeft) + " pages...");
 }
 
 void receiveAudioChunk(const uint8_t* data, int len) {
