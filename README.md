@@ -27,7 +27,9 @@ Pain and Seizure use dedicated always-on detectors — they're safety-critical a
 
 **Gesture matching.** A recorded gesture is 64 samples of 6-axis IMU data at 50Hz (1.28s), z-normalised per axis so matching depends on the shape of the movement rather than how hard it was performed. Live motion above a trigger threshold is captured the same way and scored against every stored template using banded DTW (Dynamic Time Warping); the closest match under a distance threshold fires. Tune the threshold with `GT,<value>` and watch reported distances in the status log.
 
-**Voice storage.** Clips are 8kHz mono PCM16, up to 2.5s each, written to reserved internal flash via mbed `FlashIAP`. nRF52840 flash is memory-mapped, so playback streams straight from a flash pointer with no RAM buffering.
+**Voice recording.** Clips are recorded **on the device itself** through the XIAO Sense's onboard PDM microphone, not transferred from the phone. The mic samples at 16kHz and sample pairs are averaged down to the 8kHz the playback path uses. Clips are up to 2.5s, written to reserved internal flash via mbed `FlashIAP`. nRF52840 flash is memory-mapped, so playback streams straight from a flash pointer with no RAM buffering.
+
+Bluetooth only carries a short `RECV,<slot>` command — there is no bulk audio transfer. An earlier design pushed the 40KB clip over BLE and the link dropped mid-upload: with no SoftDevice on this core, flash writes block interrupts, and write-without-response has no flow control, so the device's BLE buffers were exhausted. Recording locally removes that entire failure mode rather than tuning around it.
 
 ### Flash map
 
@@ -63,7 +65,7 @@ Both interfaces share one dispatcher, so every command works over USB serial and
 | `PLAY,<slot>` | Play a message's voice clip |
 | `DEL,<slot>` | Erase a message's clip and gesture |
 | `GT,<value>` | Set the gesture match threshold (default 3.0) |
-| `AUDIO,<slot>,<bytes>` … `AUDIOEND` | Voice clip upload (used by the app) |
+| `RECV,<slot>` | Record a voice clip from the onboard mic (one beep = speak, two beeps = saved) |
 | `V,<0-32767>` | Test tone amplitude |
 | `T` | Play a test tone |
 
@@ -74,13 +76,12 @@ Slots: `0` Pain · `1` Hunger · `2` Toilet · `3` Sleep · `4` Seizure · `5` Y
 - Service: `a5e7c000-9c3f-4a4e-8e1e-1a2b3c4d5e00`
 - Command (write): `…5e01`
 - Status (notify): `…5e02`
-- Audio data (write w/o response): `…5e03`
 
-Clients should negotiate a larger MTU — the default 23-byte ATT MTU truncates status messages to ~20 bytes and makes clip upload very slow.
+Clients should negotiate a larger MTU — the default 23-byte ATT MTU truncates status messages to ~20 bytes.
 
 ## Android app
 
-Kotlin, minSdk 26, no Compose. One row per message with **Gesture / Voice / Play / Delete**. Voice is captured with `AudioRecord` (raw PCM16 @ 8kHz), peak-normalised, then streamed to the device in MTU-sized chunks with flow control driven by `onCharacteristicWrite`.
+Kotlin, minSdk 26, no Compose. One row per message with **Gesture / Voice / Play / Delete**. Each button sends a short command; the device does the recording and storage itself, so the app needs no microphone permission and transfers no audio.
 
 ```bash
 cd app
@@ -94,6 +95,8 @@ Output: `app/build/outputs/apk/debug/app-debug.apk` (debug-signed, sideloadable)
 The source specification also calls for a status display, a dedicated physical emergency button, an activation lock, rechargeable battery with all-day runtime, and waterproof charging. Those are hardware requirements and aren't addressed by this firmware/app.
 
 ## Recent changes
+
+- **2026-10-05** — Voice is now recorded on-device via the onboard PDM mic instead of being uploaded over BLE, which removes the mid-upload disconnects entirely.
 
 - **2026-09-23** — Replaced body-part poses with the 7-message gesture vocabulary; added recordable gestures (DTW matching) and caregiver-recorded voice clips stored in internal flash and uploaded over BLE.
 - **2026-09-19** — Created public GitHub repo, combined firmware and Android app into one repository.

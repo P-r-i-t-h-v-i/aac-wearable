@@ -1,6 +1,7 @@
 #include <LSM6DS3.h>
 #include <Wire.h>
 #include <ArduinoBLE.h>
+#include <PDM.h>
 #include "FlashIAP.h"
 
 // Initialize internal IMU on Wire1 (0x6A)
@@ -97,18 +98,35 @@ uint32_t i2s_buf_1[AUDIO_BUF_SIZE];
 BLEService calService("a5e7c000-9c3f-4a4e-8e1e-1a2b3c4d5e00");
 BLEStringCharacteristic commandChar("a5e7c000-9c3f-4a4e-8e1e-1a2b3c4d5e01", BLEWrite, 32);
 BLEStringCharacteristic statusChar("a5e7c000-9c3f-4a4e-8e1e-1a2b3c4d5e02", BLERead | BLENotify, 200);
-BLECharacteristic audioChar("a5e7c000-9c3f-4a4e-8e1e-1a2b3c4d5e03", BLEWriteWithoutResponse, 244);
 
-// Audio upload state
-bool     g_uploading = false;
-int      g_uploadSlot = -1;
-uint32_t g_uploadExpected = 0;
-uint32_t g_uploadReceived = 0;
-uint32_t g_uploadWriteAddr = 0;
-uint8_t  g_uploadBuf[512];
-uint32_t g_uploadBufLen = 0;
-unsigned long g_uploadLastChunk = 0;
-const unsigned long UPLOAD_TIMEOUT_MS = 10000;
+// =========================================================
+// VOICE RECORDING (onboard PDM microphone)
+// Audio is captured by the device itself rather than transferred from the
+// phone. Pushing 40KB over BLE exhausted the link's buffers and dropped the
+// connection mid-upload; here BLE only carries a short "RECV,<slot>" command,
+// so there is no bulk transfer to fail. The board's mic makes this both
+// simpler and more reliable.
+// =========================================================
+#define REC_MAX_SAMPLES  20000      // 2.5s @ 8kHz
+#define REC_TIMEOUT_MS   4000
+
+int16_t  g_recBuf[REC_MAX_SAMPLES];
+volatile uint32_t g_recCount = 0;
+volatile bool g_recording = false;
+int16_t  g_pdmBuf[256];
+bool     g_pdmHavePending = false;
+int16_t  g_pdmPending = 0;
+
+int      g_recPendingSlot = -1;     // slot to record once its erase finishes
+int      g_recSlot = -1;
+unsigned long g_recStart = 0;
+
+// Flash write state - programming 40KB in one call would block interrupts
+// for ~400ms, so it is spread over loop() iterations like the erase.
+bool     g_flushing = false;
+uint32_t g_flushAddr = 0;
+uint32_t g_flushOffset = 0;
+#define  FLUSH_CHUNK_BYTES 512
 
 // This board's mbed core has no SoftDevice (TARGET_SOFTDEVICE_NONE) - flash
 // erase/program bangs the NVMC controller directly and disables interrupts
@@ -161,11 +179,12 @@ void setup() {
     BLE.setAdvertisedService(calService);
     calService.addCharacteristic(commandChar);
     calService.addCharacteristic(statusChar);
-    calService.addCharacteristic(audioChar);
     BLE.addService(calService);
     statusChar.writeValue("READY");
     BLE.advertise();
   }
+
+  PDM.onReceive(onPDMdata);
 
   Serial.println("\n==================================================");
   Serial.println("  GESTURE AAC WRISTBAND ACTIVE");
@@ -173,6 +192,7 @@ void setup() {
   Serial.println("                SEIZURE YES NO");
   Serial.println("  * Pain = two taps | Seizure = shake 3s");
   Serial.println("  * Others = recorded motion templates");
+  Serial.println("  * Voice recorded on-device via onboard mic");
   Serial.println("  * BLE service advertising");
   Serial.println("==================================================");
 }
@@ -194,29 +214,29 @@ void loop() {
     g_flash.erase(g_eraseAddr, sector);
     g_eraseAddr += sector;
     g_erasePagesLeft--;
-    g_uploadLastChunk = millis();
 
     if (g_erasePagesLeft <= 0) {
       g_erasing = false;
-      logStatus("[UP] erased, ready to receive");
+      if (g_recPendingSlot >= 0) {
+        startRecording(g_recPendingSlot);
+        g_recPendingSlot = -1;
+      }
     }
     return;
   }
 
-  if (audioChar.written()) {
-    receiveAudioChunk(audioChar.value(), audioChar.valueLength());
+  // Recording runs off the PDM interrupt; just watch for the end condition.
+  if (g_recording) {
+    if (g_recCount >= REC_MAX_SAMPLES || (millis() - g_recStart) > REC_TIMEOUT_MS) {
+      stopRecording();
+    }
+    return;
   }
 
-  // Suspend gesture processing while a clip is uploading. A dropped BLE
-  // connection mid-transfer would otherwise wedge the device here.
-  if (g_uploading) {
-    if (millis() - g_uploadLastChunk > UPLOAD_TIMEOUT_MS) {
-      g_uploading = false;
-      g_uploadSlot = -1;
-      g_uploadBufLen = 0;
-      logStatus("[UP] ABORTED - timed out waiting for data");
-    }
-    delay(2);
+  // Write the captured clip to flash a chunk at a time, same reasoning as
+  // the incremental erase.
+  if (g_flushing) {
+    serviceFlush();
     return;
   }
 
@@ -302,16 +322,14 @@ void handleCommand(String input) {
   input.trim();
   if (input.length() == 0) return;
 
-  int slot; long bytes; float f;
+  int slot; float f;
 
   if (input == "LIST") {
     listMessages();
   } else if (sscanf(input.c_str(), "RECG,%d", &slot) == 1) {
     recordGesture(slot);
-  } else if (sscanf(input.c_str(), "AUDIO,%d,%ld", &slot, &bytes) == 2) {
-    beginAudioUpload(slot, (uint32_t)bytes);
-  } else if (input == "AUDIOEND") {
-    finishAudioUpload();
+  } else if (sscanf(input.c_str(), "RECV,%d", &slot) == 1) {
+    beginVoiceRecording(slot);
   } else if (sscanf(input.c_str(), "PLAY,%d", &slot) == 1) {
     if (slot >= 0 && slot < MSG_COUNT) playMessage(slot);
   } else if (sscanf(input.c_str(), "DEL,%d", &slot) == 1) {
@@ -502,65 +520,123 @@ uint32_t audioLength(int slot) {
   return (n > AUDIO_MAX_SAMPLES) ? 0 : n;
 }
 
-void beginAudioUpload(int slot, uint32_t byteCount) {
-  if (!g_flashReady) { logStatus("[ERROR] flash unavailable"); return; }
-  if (slot < 0 || slot >= MSG_COUNT) { logStatus("[ERROR] bad slot"); return; }
-  if (byteCount == 0 || byteCount > (uint32_t)AUDIO_MAX_SAMPLES * 2) {
-    logStatus("[ERROR] clip too long (max 2.5s @ 8kHz)");
-    return;
-  }
+// Called from the PDM interrupt. The mic runs at 16kHz; averaging sample
+// pairs decimates to the 8kHz the playback path and flash budget expect,
+// and the averaging doubles as a crude anti-alias filter.
+void onPDMdata() {
+  int bytes = PDM.available();
+  if (bytes > (int)sizeof(g_pdmBuf)) bytes = sizeof(g_pdmBuf);
+  if (bytes <= 0) return;
+  PDM.read(g_pdmBuf, bytes);
 
-  g_uploading = true;
-  g_uploadSlot = slot;
-  g_uploadExpected = byteCount;
-  g_uploadReceived = 0;
-  g_uploadBufLen = 0;
-  g_uploadWriteAddr = slotAddr(slot) + AUDIO_HEADER_BYTES;
-  g_uploadLastChunk = millis();
+  if (!g_recording) return;
 
-  // Erase spread across loop() iterations (see g_erasing declaration) -
-  // this call only arms it, the actual erasing happens in loop().
-  g_erasing = true;
-  g_eraseAddr = slotAddr(slot);
-  g_erasePagesLeft = AUDIO_SLOT_SIZE / g_flash.get_sector_size(g_eraseAddr);
-
-  logStatus(String("[UP] ") + MSG_NAMES[slot] + " erasing " + String(g_erasePagesLeft) + " pages...");
-}
-
-void receiveAudioChunk(const uint8_t* data, int len) {
-  if (!g_uploading || len <= 0) return;
-  g_uploadLastChunk = millis();
-
-  for (int i = 0; i < len && g_uploadReceived < g_uploadExpected; i++) {
-    g_uploadBuf[g_uploadBufLen++] = data[i];
-    g_uploadReceived++;
-
-    if (g_uploadBufLen == sizeof(g_uploadBuf)) {
-      g_flash.program(g_uploadBuf, g_uploadWriteAddr, g_uploadBufLen);
-      g_uploadWriteAddr += g_uploadBufLen;
-      g_uploadBufLen = 0;
+  int n = bytes / 2;
+  for (int i = 0; i < n && g_recCount < REC_MAX_SAMPLES; i++) {
+    if (!g_pdmHavePending) {
+      g_pdmPending = g_pdmBuf[i];
+      g_pdmHavePending = true;
+    } else {
+      g_recBuf[g_recCount++] = (int16_t)(((int32_t)g_pdmPending + g_pdmBuf[i]) / 2);
+      g_pdmHavePending = false;
     }
   }
 }
 
-void finishAudioUpload() {
-  if (!g_uploading) return;
-
-  if (g_uploadBufLen > 0) {
-    // Flash programming needs a 4-byte aligned length
-    while (g_uploadBufLen % 4 != 0) g_uploadBuf[g_uploadBufLen++] = 0;
-    g_flash.program(g_uploadBuf, g_uploadWriteAddr, g_uploadBufLen);
-    g_uploadBufLen = 0;
+// "RECV,<slot>" - erase the slot first (spread over loop()), then record.
+void beginVoiceRecording(int slot) {
+  if (!g_flashReady) { logStatus("[ERROR] flash unavailable"); return; }
+  if (slot < 0 || slot >= MSG_COUNT) { logStatus("[ERROR] bad slot"); return; }
+  if (g_recording || g_erasing || g_flushing) {
+    logStatus("[ERROR] busy, try again");
+    return;
   }
 
-  uint32_t hdr[2] = { AUDIO_MAGIC, g_uploadReceived / 2 };
-  g_flash.program(hdr, slotAddr(g_uploadSlot), sizeof(hdr));
+  g_recPendingSlot = slot;
+  g_erasing = true;
+  g_eraseAddr = slotAddr(slot);
+  g_erasePagesLeft = AUDIO_SLOT_SIZE / g_flash.get_sector_size(g_eraseAddr);
 
-  logStatus(String("[UP] SAVED ") + MSG_NAMES[g_uploadSlot] + " " +
-            String(g_uploadReceived) + "/" + String(g_uploadExpected) + " bytes");
+  logStatus(String("[REC] ") + MSG_NAMES[slot] + " - get ready...");
+}
 
-  g_uploading = false;
-  g_uploadSlot = -1;
+void startRecording(int slot) {
+  g_recSlot = slot;
+  g_recCount = 0;
+  g_pdmHavePending = false;
+
+  calibrateBeep(1);              // beep = speak now
+  digitalWrite(PIN_LED_BLUE, LOW);
+
+  if (!PDM.begin(1, 16000)) {
+    logStatus("[ERROR] microphone failed to start");
+    digitalWrite(PIN_LED_BLUE, HIGH);
+    g_recSlot = -1;
+    return;
+  }
+
+  g_recStart = millis();
+  g_recording = true;
+  logStatus(String("[REC] SPEAK NOW for ") + MSG_NAMES[slot] + " (2.5s)");
+}
+
+void stopRecording() {
+  g_recording = false;
+  PDM.end();
+  digitalWrite(PIN_LED_BLUE, HIGH);
+
+  uint32_t n = g_recCount;
+  if (n < 1000) {
+    logStatus("[REC] too short / no audio captured");
+    g_recSlot = -1;
+    return;
+  }
+
+  // Peak-normalize so quiet speech still drives the amp properly.
+  int32_t peak = 1;
+  for (uint32_t i = 0; i < n; i++) {
+    int32_t a = abs(g_recBuf[i]);
+    if (a > peak) peak = a;
+  }
+  float gain = 32000.0f / (float)peak;
+  if (gain > 20.0f) gain = 20.0f;
+  for (uint32_t i = 0; i < n; i++) {
+    int32_t v = (int32_t)(g_recBuf[i] * gain);
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    g_recBuf[i] = (int16_t)v;
+  }
+
+  // Hand off to the incremental flash writer in loop().
+  g_flushing = true;
+  g_flushOffset = 0;
+  g_flushAddr = slotAddr(g_recSlot) + AUDIO_HEADER_BYTES;
+
+  logStatus(String("[REC] captured ") + String(n) + " samples, saving...");
+}
+
+void serviceFlush() {
+  uint32_t total = g_recCount * 2;
+  uint32_t remaining = total - g_flushOffset;
+  uint32_t chunk = remaining > FLUSH_CHUNK_BYTES ? FLUSH_CHUNK_BYTES : remaining;
+
+  // Flash programming needs a 4-byte aligned length
+  uint32_t aligned = (chunk + 3) & ~3u;
+
+  g_flash.program(((const uint8_t*)g_recBuf) + g_flushOffset, g_flushAddr, aligned);
+  g_flushAddr += aligned;
+  g_flushOffset += chunk;
+
+  if (g_flushOffset >= total) {
+    uint32_t hdr[2] = { AUDIO_MAGIC, g_recCount };
+    g_flash.program(hdr, slotAddr(g_recSlot), sizeof(hdr));
+
+    g_flushing = false;
+    calibrateBeep(2);            // two beeps = saved
+    logStatus(String("[REC] SAVED ") + MSG_NAMES[g_recSlot] + " " +
+              String(total) + " bytes");
+    g_recSlot = -1;
+  }
 }
 
 void deleteMessage(int slot) {
@@ -674,7 +750,10 @@ void playToneI2S(int frequency, int durationMs) {
       sample_idx++;
     }
 
-    while (NRF_I2S->EVENTS_TXPTRUPD == 0) {}
+    // Service BLE while the DMA drains this buffer (~128ms at 8kHz). Without
+    // this, a gesture-triggered clip starves the BLE stack long enough for the
+    // central to hit supervision timeout and drop the link mid-session.
+    while (NRF_I2S->EVENTS_TXPTRUPD == 0) { BLE.poll(); }
     NRF_I2S->EVENTS_TXPTRUPD = 0;
 
     NRF_I2S->TXD.PTR = (uint32_t)next_buf;
@@ -707,7 +786,10 @@ void playPCMI2S(const int16_t* samples, uint32_t total_samples) {
       sample_idx++;
     }
 
-    while (NRF_I2S->EVENTS_TXPTRUPD == 0) {}
+    // Service BLE while the DMA drains this buffer (~128ms at 8kHz). Without
+    // this, a gesture-triggered clip starves the BLE stack long enough for the
+    // central to hit supervision timeout and drop the link mid-session.
+    while (NRF_I2S->EVENTS_TXPTRUPD == 0) { BLE.poll(); }
     NRF_I2S->EVENTS_TXPTRUPD = 0;
 
     NRF_I2S->TXD.PTR = (uint32_t)next_buf;
