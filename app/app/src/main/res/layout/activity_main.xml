@@ -31,13 +31,32 @@
         android:backgroundTint="#3D5AFE"
         android:textColor="#FFFFFF" />
 
-    <ProgressBar
-        android:id="@+id/uploadProgress"
-        style="?android:attr/progressBarStyleHorizontal"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:visibility="gone"
-        android:max="100" />
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingTop="6dp">
+
+        <TextView
+            android:id="@+id/accuracyText"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Accuracy: --"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#1A1A1A" />
+
+        <Button
+            android:id="@+id/accuracyButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Check Accuracy"
+            android:textSize="12sp"
+            android:backgroundTint="#6A1B9A"
+            android:textColor="#FFFFFF" />
+    </LinearLayout>
 
     <ScrollView
         android:layout_width="match_parent"

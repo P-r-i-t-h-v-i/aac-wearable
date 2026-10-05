@@ -30,9 +30,9 @@ class MainActivity : AppCompatActivity() {
         const val DEVICE_NAME = "AAC-Wearable"
         const val SCAN_TIMEOUT_MS = 10000L
 
-        val MESSAGES = listOf("PAIN", "HUNGER", "TOILET", "SLEEP", "SEIZURE", "YES", "NO")
+        val MESSAGES = listOf("REST", "HUNGER", "TOILET", "SLEEP", "SEIZURE", "YES", "NO")
         // Pain and Seizure use fixed detectors in firmware, not recorded templates
-        val FIXED_GESTURES = mapOf(0 to "two taps", 4 to "shake 3s")
+        val FIXED_GESTURES = mapOf(4 to "shake 3s")
     }
 
     private lateinit var connectionStatus: TextView
@@ -40,6 +40,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusScroll: ScrollView
     private lateinit var connectButton: Button
     private lateinit var messageContainer: LinearLayout
+    private lateinit var accuracyText: TextView
 
     private val rowStates = mutableListOf<TextView>()
 
@@ -79,6 +80,8 @@ class MainActivity : AppCompatActivity() {
         statusScroll = findViewById(R.id.statusScroll)
         connectButton = findViewById(R.id.connectButton)
         messageContainer = findViewById(R.id.messageContainer)
+        accuracyText = findViewById(R.id.accuracyText)
+        findViewById<Button>(R.id.accuracyButton).setOnClickListener { sendCommand("ACC") }
 
         connectButton.setOnClickListener { onConnectClicked() }
         buildMessageRows()
@@ -101,6 +104,7 @@ class MainActivity : AppCompatActivity() {
                 gestureBtn.isEnabled = false
                 gestureBtn.text = "Fixed"
             } else {
+                gestureBtn.text = "Train x10"
                 gestureBtn.setOnClickListener { sendCommand("RECG,$slot") }
             }
 
@@ -252,10 +256,27 @@ class MainActivity : AppCompatActivity() {
             val text = characteristic.getStringValue(0) ?: return
             log(text)
             updateRowFromStatus(text)
+            updateAccuracy(text)
         }
     }
 
-    // Firmware LIST lines look like: "1 HUNGER voice:YES gesture:--"
+    // Firmware accuracy lines: "[ACC] HUNGER 9/10 (90%)", "[ACC] OVERALL 57/60 = 95.0%"
+    private fun updateAccuracy(text: String) {
+        if (!text.startsWith("[ACC]")) return
+        val body = text.removePrefix("[ACC]").trim()
+        runOnUiThread {
+            when {
+                body.startsWith("checking") -> accuracyText.text = "Accuracy: checking..."
+                body.startsWith("OVERALL") ->
+                    accuracyText.text = "Accuracy: " + body.removePrefix("OVERALL").trim()
+                body.startsWith("Train at least") -> accuracyText.text = "Accuracy: $body"
+            }
+        }
+        // Train/delete change the gesture counts, so refresh the rows.
+        if (text.contains("match limit")) mainHandler.postDelayed({ sendCommand("LIST") }, 300)
+    }
+
+    // Firmware LIST lines look like: "1 HUNGER voice:YES gesture:7/10"
     private fun updateRowFromStatus(text: String) {
         val parts = text.trim().split(" ")
         if (parts.size < 4) return
@@ -268,7 +289,7 @@ class MainActivity : AppCompatActivity() {
             val v = if (voice == "YES") "voice ✓" else "no voice"
             val g = when {
                 FIXED_GESTURES.containsKey(slot) -> "gesture: ${FIXED_GESTURES[slot]}"
-                gesture == "YES" -> "gesture ✓"
+                gesture.endsWith("/10") && !gesture.startsWith("0/") -> "gesture $gesture"
                 else -> "no gesture"
             }
             rowStates[slot].text = "$v · $g"

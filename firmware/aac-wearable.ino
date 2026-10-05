@@ -3,6 +3,7 @@
 #include <ArduinoBLE.h>
 #include <PDM.h>
 #include "FlashIAP.h"
+#include "gesture_types.h"
 
 // Initialize internal IMU on Wire1 (0x6A)
 LSM6DS3 myIMU(I2C_MODE, 0x6A);
@@ -12,23 +13,23 @@ LSM6DS3 myIMU(I2C_MODE, 0x6A);
 
 // =========================================================
 // COMMUNICATION MESSAGES
-// Pain and Seizure keep dedicated always-on detectors (double tap /
-// sustained shake). The other five are matched against motion templates
-// the caregiver records, so each one is whatever movement they choose.
+// Seizure keeps a dedicated always-on shake detector - it is safety-critical
+// and must not depend on a trained model. The other six are learned from
+// recordings the caregiver makes on the device (10 each).
 // =========================================================
 enum MsgId {
-  MSG_PAIN = 0, MSG_HUNGER = 1, MSG_TOILET = 2, MSG_SLEEP = 3,
+  MSG_REST = 0, MSG_HUNGER = 1, MSG_TOILET = 2, MSG_SLEEP = 3,
   MSG_SEIZURE = 4, MSG_YES = 5, MSG_NO = 6
 };
 #define MSG_COUNT 7
 
 const char* MSG_NAMES[MSG_COUNT] = {
-  "PAIN", "HUNGER", "TOILET", "SLEEP", "SEIZURE", "YES", "NO"
+  "REST", "HUNGER", "TOILET", "SLEEP", "SEIZURE", "YES", "NO"
 };
 
-// Slots driven by recorded templates (Pain/Seizure use fixed detectors)
+// Slots learned from recordings (Seizure uses its fixed detector)
 bool isTemplateSlot(int id) {
-  return id != MSG_PAIN && id != MSG_SEIZURE;
+  return id != MSG_SEIZURE;
 }
 
 // =========================================================
@@ -43,49 +44,75 @@ bool isTemplateSlot(int id) {
 #define AUDIO_MAGIC         0xA1C0DE01
 #define AUDIO_MAX_SAMPLES   ((AUDIO_SLOT_SIZE - AUDIO_HEADER_BYTES) / 2)
 
-#define TEMPLATE_ADDR       0xE6000      // single 4KB page holds all templates
-#define TEMPLATE_MAGIC      0x6E5701
-
 mbed::FlashIAP g_flash;
 bool g_flashReady = false;
 
 // =========================================================
-// GESTURE TEMPLATES
-// 64 samples @ 50Hz = 1.28s of 6-axis motion, z-normalized per axis.
+// LEARNED GESTURES
+// Each recording is 64 samples @ 50Hz (1.28s) of 6 axes: accelerometer
+// x/y/z and gyro x/y/z. The accelerometer is kept raw rather than
+// mean-subtracted so the arm's orientation (which way gravity points, i.e.
+// where the hand is) counts toward the match, not just the motion shape.
+// Values are stored as int8: 32 units = 1g for accel, 32 units = 256dps
+// for gyro, so both axes groups weigh comparably in the distance.
+//
+// Classification is k-nearest-neighbour (k=3) over all stored recordings
+// using banded DTW, so the model learns the natural spread of how the
+// person performs each gesture rather than matching one snapshot.
 // =========================================================
-#define GEST_LEN   64
-#define GEST_AXES  6
-#define GEST_BAND  8     // Sakoe-Chiba band for DTW
+#define GEST_BAND         8           // DTW warp window, +/-160ms
+#define ACCEL_SCALE       32.0f       // units per g
+#define GYRO_SCALE        (1.0f / 8)  // units per dps
 
-struct GestureTemplate {
-  uint32_t magic;
-  int16_t data[GEST_LEN * GEST_AXES];
-};
+// One 4KB flash page per message holds its 10 recordings (3848 bytes).
+// 7 pages: 0xE6000..0xED000, the top of the app region.
+#define TEMPLATE_BASE     0xE6000
+#define TEMPLATE_PAGE     0x1000
+#define TEMPLATE_MAGIC    0x6E5710
 
-GestureTemplate g_templates[MSG_COUNT];
-float g_gestureThreshold = 3.0;          // tune via "GT,<value>"
+float g_gestureThreshold = 40.0f;     // recalibrated from training data
+// Floor for the calibrated limit. Very consistent repeats can put repeats
+// almost on top of each other (still recordings measured ~0), which would
+// otherwise set a limit no live attempt could ever meet. In feature units:
+// ~0.4g or ~3dps average deviation per axis.
+const float GESTURE_THRESHOLD_MIN = 12.0f;
+unsigned long g_accStartMs = 0;
 
 // Live gesture capture state
 bool  g_capturing = false;
 int   g_captureIdx = 0;
-int16_t g_captureBuf[GEST_LEN * GEST_AXES];
+int8_t g_captureBuf[WIN_BYTES];
 unsigned long g_lastTriggerTime = 0;
 const unsigned long GESTURE_COOLDOWN_MS = 2000;
 const float GESTURE_TRIGGER_DPS = 120.0;  // motion energy needed to start capture
 
+// Training state (10 reps, run one step per loop() so BLE stays serviced)
+enum TrainPhase { TR_IDLE, TR_GAP, TR_ARMED, TR_CAPTURE };
+TrainPhase g_trainPhase = TR_IDLE;
+int  g_trainSlot = -1;
+int  g_trainRep = 0;
+int  g_trainIdx = 0;
+unsigned long g_trainT = 0;
+ClassTemplates g_trainPage;
+const unsigned long TRAIN_FIRST_GAP_MS = 2000;
+const unsigned long TRAIN_GAP_MS = 1500;
+const unsigned long TRAIN_ARM_TIMEOUT_MS = 2500;
+
+// Accuracy check (leave-one-out), also one sample per loop()
+bool  g_accRunning = false;
+int   g_accC = 0, g_accR = 0;
+int   g_accCorrect[MSG_COUNT], g_accTotal[MSG_COUNT];
+float g_accMaxSame = 0;
+
 int16_t g_testAmplitude = 32767;
 
 // =========================================================
-// PAIN (DOUBLE TAP) + SEIZURE (SHAKE) DETECTORS
+// SEIZURE (SHAKE) DETECTOR
 // =========================================================
 unsigned long shakeStartTime = 0;
 unsigned long lastShakeTime = 0;
 const float SHAKE_THRESHOLD_DPS = 300.0;
 const unsigned long REQUIRED_SHAKE_DURATION_MS = 3000;
-
-int tapCount = 0;
-unsigned long lastTapTime = 0;
-const float TAP_THRESHOLD_G = 2.5;
 
 // Audio Buffer
 #define AUDIO_BUF_SIZE 1024
@@ -121,7 +148,7 @@ BLEStringCharacteristic statusChar("a5e7c000-9c3f-4a4e-8e1e-1a2b3c4d5e02", BLERe
 // the loudness normalization below does the rest.
 #define PDM_GAIN_MAX     0x50
 int   g_micGain = 0x28;
-float REC_TARGET_RMS = 0.22f;       // tune with "MR,<0.05-0.5>"
+float REC_TARGET_RMS = 0.35f;       // tune with "MR,<0.05-0.5>"
 
 int16_t  g_recBuf[REC_MAX_SAMPLES];
 volatile uint32_t g_recCount = 0;
@@ -183,7 +210,6 @@ void setup() {
   } else {
     Serial.println("[ERROR] Flash init failed - recordings unavailable");
   }
-  loadTemplates();
 
   if (!BLE.begin()) {
     Serial.println("[ERROR] BLE init failed!");
@@ -201,13 +227,16 @@ void setup() {
 
   Serial.println("\n==================================================");
   Serial.println("  GESTURE AAC WRISTBAND ACTIVE");
-  Serial.println("  * 7 messages: PAIN HUNGER TOILET SLEEP");
+  Serial.println("  * 7 messages: REST HUNGER TOILET SLEEP");
   Serial.println("                SEIZURE YES NO");
-  Serial.println("  * Pain = two taps | Seizure = shake 3s");
-  Serial.println("  * Others = recorded motion templates");
+  Serial.println("  * Seizure = shake 3s (fixed)");
+  Serial.println("  * Others = learned from 10 recordings each");
   Serial.println("  * Voice recorded on-device via onboard mic");
   Serial.println("  * BLE service advertising");
   Serial.println("==================================================");
+
+  // Calibrate the match threshold from whatever is already trained.
+  beginAccuracy();
 }
 
 void loop() {
@@ -259,27 +288,17 @@ void loop() {
   float gx = myIMU.readFloatGyroX();
   float gy = myIMU.readFloatGyroY();
   float gz = myIMU.readFloatGyroZ();
+  float gyro_magnitude = abs(gx) + abs(gy) + abs(gz);
 
-  // --- PAIN: two sharp taps ---
-  float accel_magnitude = sqrt(ax*ax + ay*ay + az*az);
-  if (accel_magnitude > TAP_THRESHOLD_G) {
-    if (millis() - lastTapTime > 250) {
-      tapCount++;
-      lastTapTime = millis();
-      if (tapCount == 2) {
-        tapCount = 0;
-        playMessage(MSG_PAIN);
-        g_lastTriggerTime = millis();
-        return;
-      }
-    }
-  }
-  if (tapCount == 1 && (millis() - lastTapTime > 1500)) {
-    tapCount = 0;
+  // Training owns the IMU while it runs - no live detection, so practising
+  // a gesture (or a vigorous one) can't fire a message or the seizure alarm.
+  if (g_trainPhase != TR_IDLE) {
+    serviceTraining(ax, ay, az, gx, gy, gz, gyro_magnitude);
+    delay(20);
+    return;
   }
 
   // --- SEIZURE: sustained vigorous shaking ---
-  float gyro_magnitude = abs(gx) + abs(gy) + abs(gz);
   if (gyro_magnitude > SHAKE_THRESHOLD_DPS) {
     if (shakeStartTime == 0) {
       shakeStartTime = millis();
@@ -296,15 +315,17 @@ void loop() {
     return;
   }
 
-  // --- TEMPLATE GESTURES ---
+  // Leave-one-out accuracy check, one recording classified per iteration.
+  // Sits after the seizure check so that safety alarm keeps running while
+  // the check works through every recording.
+  if (g_accRunning) {
+    serviceAccuracy();
+    return;
+  }
+
+  // --- LEARNED GESTURES ---
   if (g_capturing) {
-    int base = g_captureIdx * GEST_AXES;
-    g_captureBuf[base + 0] = (int16_t)(ax * 1000);
-    g_captureBuf[base + 1] = (int16_t)(ay * 1000);
-    g_captureBuf[base + 2] = (int16_t)(az * 1000);
-    g_captureBuf[base + 3] = (int16_t)gx;
-    g_captureBuf[base + 4] = (int16_t)gy;
-    g_captureBuf[base + 5] = (int16_t)gz;
+    encodeSample(&g_captureBuf[g_captureIdx * GEST_AXES], ax, ay, az, gx, gy, gz);
     g_captureIdx++;
 
     if (g_captureIdx >= GEST_LEN) {
@@ -340,7 +361,9 @@ void handleCommand(String input) {
   if (input == "LIST") {
     listMessages();
   } else if (sscanf(input.c_str(), "RECG,%d", &slot) == 1) {
-    recordGesture(slot);
+    beginTraining(slot);
+  } else if (input == "ACC") {
+    beginAccuracy();
   } else if (sscanf(input.c_str(), "RECV,%d", &slot) == 1) {
     beginVoiceRecording(slot);
   } else if (sscanf(input.c_str(), "PLAY,%d", &slot) == 1) {
@@ -374,155 +397,313 @@ void listMessages() {
     String line = String(i) + " " + MSG_NAMES[i];
     line += audioLength(i) > 0 ? " voice:YES" : " voice:--";
     if (isTemplateSlot(i)) {
-      line += g_templates[i].magic == TEMPLATE_MAGIC ? " gesture:YES" : " gesture:--";
+      line += " gesture:" + String(trainedReps(i)) + "/" + String(REPS_PER_GESTURE);
     } else {
-      line += (i == MSG_PAIN) ? " gesture:2-TAP" : " gesture:SHAKE";
+      line += " gesture:SHAKE";
     }
     logStatus(line);
   }
 }
 
 // =========================================================
-// GESTURE RECORDING + MATCHING
+// GESTURE FEATURES
 // =========================================================
-void recordGesture(int slot) {
-  if (slot < 0 || slot >= MSG_COUNT || !isTemplateSlot(slot)) {
-    logStatus("[ERROR] Slot has a fixed gesture (tap/shake)");
-    return;
-  }
-
-  logStatus(String("[REC] ") + MSG_NAMES[slot] + " gesture in 2s...");
-  delay(2000);
-  calibrateBeep(1);
-  logStatus("[REC] Perform the movement now (1.3s)");
-  digitalWrite(PIN_LED_BLUE, LOW);
-
-  for (int i = 0; i < GEST_LEN; i++) {
-    int base = i * GEST_AXES;
-    g_templates[slot].data[base + 0] = (int16_t)(myIMU.readFloatAccelX() * 1000);
-    g_templates[slot].data[base + 1] = (int16_t)(myIMU.readFloatAccelY() * 1000);
-    g_templates[slot].data[base + 2] = (int16_t)(myIMU.readFloatAccelZ() * 1000);
-    g_templates[slot].data[base + 3] = (int16_t)myIMU.readFloatGyroX();
-    g_templates[slot].data[base + 4] = (int16_t)myIMU.readFloatGyroY();
-    g_templates[slot].data[base + 5] = (int16_t)myIMU.readFloatGyroZ();
-    delay(20);
-  }
-  g_templates[slot].magic = TEMPLATE_MAGIC;
-
-  digitalWrite(PIN_LED_BLUE, HIGH);
-  calibrateBeep(2);
-  saveTemplates();
-  logStatus(String("[REC] SAVED gesture for ") + MSG_NAMES[slot]);
+static inline int8_t q8(float v) {
+  int x = (int)lroundf(v);
+  if (x > 127) x = 127;
+  if (x < -127) x = -127;
+  return (int8_t)x;
 }
 
-// Z-normalize each axis so matching is about motion shape, not amplitude.
-void normalizeWindow(const int16_t* src, float* dst) {
-  for (int a = 0; a < GEST_AXES; a++) {
-    float mean = 0;
-    for (int i = 0; i < GEST_LEN; i++) mean += src[i * GEST_AXES + a];
-    mean /= GEST_LEN;
-
-    float var = 0;
-    for (int i = 0; i < GEST_LEN; i++) {
-      float d = src[i * GEST_AXES + a] - mean;
-      var += d * d;
-    }
-    float sd = sqrt(var / GEST_LEN);
-    if (sd < 1.0) sd = 1.0;
-
-    for (int i = 0; i < GEST_LEN; i++) {
-      dst[i * GEST_AXES + a] = (src[i * GEST_AXES + a] - mean) / sd;
-    }
-  }
+void encodeSample(int8_t* out, float ax, float ay, float az,
+                  float gx, float gy, float gz) {
+  out[0] = q8(ax * ACCEL_SCALE);
+  out[1] = q8(ay * ACCEL_SCALE);
+  out[2] = q8(az * ACCEL_SCALE);
+  out[3] = q8(gx * GYRO_SCALE);
+  out[4] = q8(gy * GYRO_SCALE);
+  out[5] = q8(gz * GYRO_SCALE);
 }
 
-// Banded DTW; returns mean per-step distance.
-float dtwDistance(const float* a, const float* b) {
-  static float prev[GEST_LEN];
-  static float curr[GEST_LEN];
+const ClassTemplates* classPage(int c) {
+  return (const ClassTemplates*)(TEMPLATE_BASE + (uint32_t)c * TEMPLATE_PAGE);
+}
 
-  for (int j = 0; j < GEST_LEN; j++) prev[j] = 1e9;
-  prev[0] = 0;
+int trainedReps(int c) {
+  if (c < 0 || c >= MSG_COUNT || !isTemplateSlot(c)) return 0;
+  const ClassTemplates* p = classPage(c);
+  if (p->magic != TEMPLATE_MAGIC) return 0;
+  return (p->count > REPS_PER_GESTURE) ? REPS_PER_GESTURE : (int)p->count;
+}
+
+// Banded DTW with L1 cost over the 6 axes. Returns per-step distance in
+// the int8 feature units (32 = 1g / 256dps).
+// The Arduino build uses -Os; this inner loop runs ~3500 times for a full
+// accuracy check, so it is worth compiling for speed instead.
+__attribute__((optimize("O3")))
+float dtwDistance(const int8_t* a, const int8_t* b) {
+  static int32_t rowA[GEST_LEN], rowB[GEST_LEN];
+  const int32_t INF = 0x3FFFFFFF;
+  int32_t* prev = rowA;
+  int32_t* curr = rowB;
+
+  for (int j = 0; j < GEST_LEN; j++) prev[j] = INF;
+  for (int j = 0; j <= GEST_BAND && j < GEST_LEN; j++) {
+    int32_t c = 0;
+    for (int k = 0; k < GEST_AXES; k++) c += abs(a[k] - b[j * GEST_AXES + k]);
+    prev[j] = (j == 0) ? c : prev[j - 1] + c;
+  }
 
   for (int i = 1; i < GEST_LEN; i++) {
-    for (int j = 0; j < GEST_LEN; j++) curr[j] = 1e9;
-
-    int lo = max(1, i - GEST_BAND);
-    int hi = min(GEST_LEN - 1, i + GEST_BAND);
+    for (int j = 0; j < GEST_LEN; j++) curr[j] = INF;
+    int lo = i - GEST_BAND; if (lo < 0) lo = 0;
+    int hi = i + GEST_BAND; if (hi > GEST_LEN - 1) hi = GEST_LEN - 1;
 
     for (int j = lo; j <= hi; j++) {
-      float cost = 0;
+      int32_t c = 0;
       for (int k = 0; k < GEST_AXES; k++) {
-        float d = a[i * GEST_AXES + k] - b[j * GEST_AXES + k];
-        cost += d * d;
+        c += abs(a[i * GEST_AXES + k] - b[j * GEST_AXES + k]);
       }
-      cost = sqrt(cost);
-
-      float best = prev[j];
-      if (prev[j - 1] < best) best = prev[j - 1];
-      if (curr[j - 1] < best) best = curr[j - 1];
-      curr[j] = cost + best;
+      int32_t best = prev[j];
+      if (j > 0) {
+        if (prev[j - 1] < best) best = prev[j - 1];
+        if (curr[j - 1] < best) best = curr[j - 1];
+      }
+      curr[j] = (best >= INF) ? INF : best + c;
     }
-    for (int j = 0; j < GEST_LEN; j++) prev[j] = curr[j];
+    int32_t* t = prev; prev = curr; curr = t;
   }
-  return prev[GEST_LEN - 1] / GEST_LEN;
+  return (float)prev[GEST_LEN - 1] / (float)GEST_LEN;
+}
+
+// k=3 nearest-neighbour vote over every stored recording, skipping
+// (exC, exR) so leave-one-out can test a recording against the rest.
+// nearest = distance to the closest recording of any class;
+// nearestSame = distance to the closest recording of sameC (if sameC >= 0).
+int knnClassify(const int8_t* win, int exC, int exR, int sameC,
+                float* nearest, float* nearestSame) {
+  float bd[3] = {1e9f, 1e9f, 1e9f};
+  int   bc[3] = {-1, -1, -1};
+  float same = 1e9f;
+
+  // DTW revisits each value ~17 times. Stored recordings live in flash,
+  // where data reads are slow, so copy both sides into RAM once first.
+  static int8_t query[WIN_BYTES];
+  static int8_t ref[WIN_BYTES];
+  memcpy(query, win, WIN_BYTES);
+
+  for (int c = 0; c < MSG_COUNT; c++) {
+    int n = trainedReps(c);
+    const ClassTemplates* p = classPage(c);
+    for (int r = 0; r < n; r++) {
+      if (c == exC && r == exR) continue;
+      memcpy(ref, p->win[r], WIN_BYTES);
+      float d = dtwDistance(query, ref);
+      if (c == sameC && d < same) same = d;
+
+      if (d < bd[2]) {
+        int pos = 2;
+        while (pos > 0 && d < bd[pos - 1]) {
+          bd[pos] = bd[pos - 1]; bc[pos] = bc[pos - 1]; pos--;
+        }
+        bd[pos] = d; bc[pos] = c;
+      }
+    }
+  }
+
+  if (nearest) *nearest = bd[0];
+  if (nearestSame) *nearestSame = same;
+  if (bc[0] < 0) return -1;
+
+  // Majority of the 3; with no majority the closest one wins.
+  if (bc[1] >= 0 && bc[1] == bc[2] && bc[1] != bc[0]) return bc[1];
+  return bc[0];
 }
 
 int matchGesture() {
-  static float liveNorm[GEST_LEN * GEST_AXES];
-  static float tmplNorm[GEST_LEN * GEST_AXES];
+  float nearest = 1e9f;
+  int pred = knnClassify(g_captureBuf, -1, -1, -1, &nearest, nullptr);
+  if (pred < 0) return -1;
 
-  normalizeWindow(g_captureBuf, liveNorm);
+  bool ok = nearest <= g_gestureThreshold;
+  logStatus(String("[GESTURE] ") + MSG_NAMES[pred] + " dist=" + String(nearest, 1) +
+            " limit=" + String(g_gestureThreshold, 1) + (ok ? " MATCH" : " (no match)"));
+  return ok ? pred : -1;
+}
 
-  int bestSlot = -1;
-  float bestDist = 1e9;
+// =========================================================
+// TRAINING: 10 recordings per gesture
+// Runs as a state machine in loop() (one IMU sample per iteration). A
+// blocking 10-rep loop would hold off BLE for ~30s and drop the link.
+// Each rep waits for motion to start before capturing, the same trigger the
+// live detector uses, so training and live windows line up the same way.
+// =========================================================
+bool deviceBusy() {
+  return g_recording || g_erasing || g_flushing ||
+         g_trainPhase != TR_IDLE || g_accRunning;
+}
 
-  for (int i = 0; i < MSG_COUNT; i++) {
-    if (!isTemplateSlot(i) || g_templates[i].magic != TEMPLATE_MAGIC) continue;
-    normalizeWindow(g_templates[i].data, tmplNorm);
-    float d = dtwDistance(liveNorm, tmplNorm);
-    if (d < bestDist) {
-      bestDist = d;
-      bestSlot = i;
+void beginTraining(int slot) {
+  if (slot < 0 || slot >= MSG_COUNT || !isTemplateSlot(slot)) {
+    logStatus("[ERROR] That message uses a fixed gesture (shake)");
+    return;
+  }
+  if (!g_flashReady) { logStatus("[ERROR] flash unavailable"); return; }
+  if (deviceBusy()) { logStatus("[ERROR] busy, try again"); return; }
+
+  g_trainSlot = slot;
+  g_trainRep = 0;
+  g_trainPhase = TR_GAP;
+  g_trainT = millis();
+  g_capturing = false;
+  logStatus(String("[TRAIN] ") + MSG_NAMES[slot] + ": do the movement " +
+            String(REPS_PER_GESTURE) + " times, starting after each beep");
+}
+
+void serviceTraining(float ax, float ay, float az,
+                     float gx, float gy, float gz, float gyroMag) {
+  unsigned long now = millis();
+
+  switch (g_trainPhase) {
+    case TR_GAP: {
+      unsigned long gap = (g_trainRep == 0) ? TRAIN_FIRST_GAP_MS : TRAIN_GAP_MS;
+      if (now - g_trainT >= gap) {
+        calibrateBeep(1);
+        g_trainPhase = TR_ARMED;
+        g_trainT = millis();
+        logStatus(String("[TRAIN] ") + MSG_NAMES[g_trainSlot] + " rep " +
+                  String(g_trainRep + 1) + "/" + String(REPS_PER_GESTURE) + " - go");
+      }
+      break;
     }
+    case TR_ARMED:
+      // Start on motion like the live detector; a still gesture times out
+      // and is captured anyway so it can still be learned.
+      if (gyroMag > GESTURE_TRIGGER_DPS || now - g_trainT > TRAIN_ARM_TIMEOUT_MS) {
+        g_trainPhase = TR_CAPTURE;
+        g_trainIdx = 0;
+        digitalWrite(PIN_LED_BLUE, LOW);
+      }
+      break;
+
+    case TR_CAPTURE:
+      encodeSample(&g_trainPage.win[g_trainRep][g_trainIdx * GEST_AXES],
+                   ax, ay, az, gx, gy, gz);
+      if (++g_trainIdx >= GEST_LEN) {
+        digitalWrite(PIN_LED_BLUE, HIGH);
+        g_trainRep++;
+        if (g_trainRep >= REPS_PER_GESTURE) {
+          finishTraining();
+        } else {
+          g_trainPhase = TR_GAP;
+          g_trainT = millis();
+        }
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+void finishTraining() {
+  int slot = g_trainSlot;
+  g_trainPhase = TR_IDLE;
+  g_trainSlot = -1;
+
+  g_trainPage.magic = TEMPLATE_MAGIC;
+  g_trainPage.count = REPS_PER_GESTURE;
+
+  // One page: ~85ms erase + ~40ms program, short enough not to drop BLE.
+  uint32_t addr = TEMPLATE_BASE + (uint32_t)slot * TEMPLATE_PAGE;
+  if (g_flash.erase(addr, TEMPLATE_PAGE) != 0 ||
+      g_flash.program(&g_trainPage, addr, sizeof(ClassTemplates)) != 0) {
+    logStatus("[ERROR] could not save gesture");
+    return;
   }
 
-  if (bestSlot >= 0) {
-    logStatus(String("[GESTURE] best=") + MSG_NAMES[bestSlot] +
-              " dist=" + String(bestDist, 2) +
-              (bestDist <= g_gestureThreshold ? " MATCH" : " (no match)"));
-    if (bestDist <= g_gestureThreshold) return bestSlot;
+  calibrateBeep(2);
+  logStatus(String("[TRAIN] SAVED ") + MSG_NAMES[slot] + " (" +
+            String(REPS_PER_GESTURE) + " recordings)");
+  g_lastTriggerTime = millis();
+  beginAccuracy();
+}
+
+// =========================================================
+// ACCURACY (leave-one-out)
+// Each recording is classified using only the other recordings, so the
+// score reflects how well an unseen repeat would be recognised - testing a
+// recording against itself would always score 100%. The same pass sets the
+// live match threshold from how far apart repeats of one gesture land.
+// =========================================================
+int nextTrainedClass(int from) {
+  for (int c = from; c < MSG_COUNT; c++) {
+    if (trainedReps(c) >= 2) return c;
   }
   return -1;
 }
 
-// =========================================================
-// FLASH: TEMPLATES
-// =========================================================
-void loadTemplates() {
+void beginAccuracy() {
   if (!g_flashReady) return;
-  for (int i = 0; i < MSG_COUNT; i++) g_templates[i].magic = 0;
+  int first = nextTrainedClass(0);
+  if (first < 0) return;   // nothing trained yet
 
-  const uint8_t* p = (const uint8_t*)TEMPLATE_ADDR;
-  for (int i = 0; i < MSG_COUNT; i++) {
-    const GestureTemplate* t = (const GestureTemplate*)(p + i * sizeof(GestureTemplate));
-    if (t->magic == TEMPLATE_MAGIC) {
-      memcpy(&g_templates[i], t, sizeof(GestureTemplate));
-    }
+  for (int i = 0; i < MSG_COUNT; i++) { g_accCorrect[i] = 0; g_accTotal[i] = 0; }
+  g_accMaxSame = 0;
+  g_accC = first;
+  g_accR = 0;
+  g_accRunning = true;
+  g_accStartMs = millis();
+  logStatus("[ACC] checking accuracy...");
+}
+
+void serviceAccuracy() {
+  const ClassTemplates* p = classPage(g_accC);
+  float nearest, nearestSame;
+  int pred = knnClassify(p->win[g_accR], g_accC, g_accR, g_accC, &nearest, &nearestSame);
+
+  g_accTotal[g_accC]++;
+  if (pred == g_accC) g_accCorrect[g_accC]++;
+  if (nearestSame < 1e8f && nearestSame > g_accMaxSame) g_accMaxSame = nearestSame;
+
+  if (++g_accR >= trainedReps(g_accC)) {
+    g_accR = 0;
+    g_accC = nextTrainedClass(g_accC + 1);
+    if (g_accC < 0) finishAccuracy();
   }
 }
 
-void saveTemplates() {
-  if (!g_flashReady) return;
-  uint32_t sector = g_flash.get_sector_size(TEMPLATE_ADDR);
-  if (g_flash.erase(TEMPLATE_ADDR, sector) != 0) {
-    logStatus("[ERROR] template erase failed");
-    return;
+void finishAccuracy() {
+  g_accRunning = false;
+
+  // Accept a live gesture if it is as close to its nearest stored recording
+  // as the furthest-apart repeats were, plus margin.
+  if (g_accMaxSame > 0) g_gestureThreshold = g_accMaxSame * 1.5f;
+  if (g_gestureThreshold < GESTURE_THRESHOLD_MIN) g_gestureThreshold = GESTURE_THRESHOLD_MIN;
+
+  int classes = 0, correct = 0, total = 0;
+  for (int c = 0; c < MSG_COUNT; c++) {
+    if (g_accTotal[c] == 0) continue;
+    classes++;
+    correct += g_accCorrect[c];
+    total += g_accTotal[c];
   }
-  uint32_t total = sizeof(GestureTemplate) * MSG_COUNT;
-  if (g_flash.program(g_templates, TEMPLATE_ADDR, total) != 0) {
-    logStatus("[ERROR] template write failed");
+
+  if (classes < 2) {
+    logStatus("[ACC] Train at least 2 gestures to measure accuracy");
+  } else {
+    for (int c = 0; c < MSG_COUNT; c++) {
+      if (g_accTotal[c] == 0) continue;
+      logStatus(String("[ACC] ") + MSG_NAMES[c] + " " + String(g_accCorrect[c]) + "/" +
+                String(g_accTotal[c]) + " (" +
+                String(100.0f * g_accCorrect[c] / g_accTotal[c], 0) + "%)");
+    }
+    logStatus(String("[ACC] OVERALL ") + String(correct) + "/" + String(total) +
+              " = " + String(100.0f * correct / total, 1) + "%");
   }
+  logStatus("[ACC] match limit set to " + String(g_gestureThreshold, 1) +
+            " (check took " + String(millis() - g_accStartMs) + "ms)");
+  g_lastTriggerTime = millis();
 }
 
 // =========================================================
@@ -567,7 +748,7 @@ void onPDMdata() {
 void beginVoiceRecording(int slot) {
   if (!g_flashReady) { logStatus("[ERROR] flash unavailable"); return; }
   if (slot < 0 || slot >= MSG_COUNT) { logStatus("[ERROR] bad slot"); return; }
-  if (g_recording || g_erasing || g_flushing) {
+  if (deviceBusy()) {
     logStatus("[ERROR] busy, try again");
     return;
   }
@@ -689,10 +870,20 @@ void serviceFlush() {
 
 void deleteMessage(int slot) {
   if (!g_flashReady || slot < 0 || slot >= MSG_COUNT) return;
-  g_flash.erase(slotAddr(slot), AUDIO_SLOT_SIZE);
-  g_templates[slot].magic = 0;
-  saveTemplates();
+  if (deviceBusy()) { logStatus("[ERROR] busy, try again"); return; }
+
+  // Gesture page: one erase (~85ms). Voice slot: 10 pages, so it goes
+  // through the incremental eraser rather than one long blocking call.
+  if (isTemplateSlot(slot)) {
+    g_flash.erase(TEMPLATE_BASE + (uint32_t)slot * TEMPLATE_PAGE, TEMPLATE_PAGE);
+  }
+  g_recPendingSlot = -1;
+  g_erasing = true;
+  g_eraseAddr = slotAddr(slot);
+  g_erasePagesLeft = AUDIO_SLOT_SIZE / g_flash.get_sector_size(g_eraseAddr);
+
   logStatus(String("[OK] Cleared ") + MSG_NAMES[slot]);
+  beginAccuracy();
 }
 
 // =========================================================
@@ -723,8 +914,6 @@ void playMessage(int slot) {
     // No recording yet - fall back to an alert pattern so it still signals
     if (slot == MSG_SEIZURE) {
       for (int i = 0; i < 6; i++) { playToneI2S(1400, 400); playToneI2S(900, 400); }
-    } else if (slot == MSG_PAIN) {
-      playToneI2S(1200, 2000);
     } else {
       for (int i = 0; i <= slot; i++) { playToneI2S(1000, 150); delay(100); }
     }

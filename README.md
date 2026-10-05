@@ -8,15 +8,15 @@ Gestures and voice clips are both **recorded by the caregiver** through a compan
 
 | Message | Gesture |
 |---|---|
-| Pain | Two sharp taps of the wrist against a surface *(fixed)* |
+| Rest | Learned from 10 recordings |
 | Seizure / Fits | Vigorous shaking for 3s *(fixed)* |
-| Hunger | Recorded by caregiver |
-| Toilet | Recorded by caregiver |
-| Sleep | Recorded by caregiver |
-| Yes | Recorded by caregiver |
-| No | Recorded by caregiver |
+| Hunger | Learned from 10 recordings |
+| Toilet | Learned from 10 recordings |
+| Sleep | Learned from 10 recordings |
+| Yes | Learned from 10 recordings |
+| No | Learned from 10 recordings |
 
-Pain and Seizure use dedicated always-on detectors — they're safety-critical and shouldn't depend on template matching. The other five are matched against motion templates the caregiver records, which also means the caregiver picks movements that are meaningfully distinct from each other.
+Seizure uses a dedicated always-on shake detector — it's safety-critical and shouldn't depend on a learned model. The other six are learned on the watch from 10 recordings each, so the caregiver picks movements that are meaningfully distinct from each other.
 
 ## Structure
 
@@ -25,7 +25,9 @@ Pain and Seizure use dedicated always-on detectors — they're safety-critical a
 
 ## How it works
 
-**Gesture matching.** A recorded gesture is 64 samples of 6-axis IMU data at 50Hz (1.28s), z-normalised per axis so matching depends on the shape of the movement rather than how hard it was performed. Live motion above a trigger threshold is captured the same way and scored against every stored template using banded DTW (Dynamic Time Warping); the closest match under a distance threshold fires. Tune the threshold with `GT,<value>` and watch reported distances in the status log.
+**Gesture learning.** Each recording is 64 samples of 6-axis IMU data at 50Hz (1.28s): accelerometer x/y/z and gyro x/y/z, stored as int8. The accelerometer is kept raw rather than mean-subtracted, so the arm's orientation (where the hand is) counts toward a match, not just the motion shape. `RECG,<slot>` records 10 repetitions; each one waits for motion to start, the same trigger live detection uses, so training and live windows line up. Live motion is classified by 3-nearest-neighbour voting over every stored recording using banded DTW.
+
+**Accuracy.** After training, the watch runs a leave-one-out check: each recording is classified using only the others, so the score reflects how well an unseen repeat would be recognised (testing a recording against itself would always score 100%). It reports per-gesture and overall accuracy, and sets the live match limit from how far apart repeats of the same gesture landed. Re-run any time with `ACC`. The seizure detector keeps running during the check.
 
 **Voice recording.** Clips are recorded **on the device itself** through the XIAO Sense's onboard PDM microphone, not transferred from the phone. The mic samples at 16kHz and sample pairs are averaged down to the 8kHz the playback path uses. Clips are up to 2.5s, written to reserved internal flash via mbed `FlashIAP`. nRF52840 flash is memory-mapped, so playback streams straight from a flash pointer with no RAM buffering.
 
@@ -39,7 +41,7 @@ App region is `0x27000`–`0xED000`.
 |---|---|---|---|
 | Sketch | `0x27000`–`0xA0000` | 495KB limit | firmware (~346KB) |
 | Voice clips | `0xA0000`–`0xE6000` | 7 × 40KB | one slot per message |
-| Gesture templates | `0xE6000` | 4KB | all templates in one page |
+| Gesture recordings | `0xE6000`–`0xED000` | 7 × 4KB | 10 recordings per message, one page each |
 
 > The compiled sketch must stay below `0xA0000` or it will collide with stored clips. The build output reports the size — check it after adding code.
 
@@ -61,15 +63,16 @@ Both interfaces share one dispatcher, so every command works over USB serial and
 | Command | Effect |
 |---|---|
 | `LIST` | Show all 7 messages and whether each has a voice clip / gesture |
-| `RECG,<slot>` | Record a gesture template (2s to get ready, one beep, 1.3s capture, two beeps = saved) |
+| `RECG,<slot>` | Learn a gesture from 10 recordings (beep before each, two beeps when saved), then report accuracy |
+| `ACC` | Re-run the accuracy check |
 | `PLAY,<slot>` | Play a message's voice clip |
 | `DEL,<slot>` | Erase a message's clip and gesture |
-| `GT,<value>` | Set the gesture match threshold (default 3.0) |
+| `GT,<value>` | Override the gesture match limit (normally set automatically by `ACC`) |
 | `RECV,<slot>` | Record a voice clip from the onboard mic (one beep = speak, two beeps = saved) |
 | `V,<0-32767>` | Test tone amplitude |
 | `T` | Play a test tone |
 
-Slots: `0` Pain · `1` Hunger · `2` Toilet · `3` Sleep · `4` Seizure · `5` Yes · `6` No
+Slots: `0` Rest · `1` Hunger · `2` Toilet · `3` Sleep · `4` Seizure · `5` Yes · `6` No
 
 ### BLE service
 
@@ -95,6 +98,8 @@ Output: `app/build/outputs/apk/debug/app-debug.apk` (debug-signed, sideloadable)
 The source specification also calls for a status display, a dedicated physical emergency button, an activation lock, rechargeable battery with all-day runtime, and waterproof charging. Those are hardware requirements and aren't addressed by this firmware/app.
 
 ## Recent changes
+
+- **2026-10-05** — Pain replaced by Rest; gestures learned on-device from 10 recordings each (k-NN over raw accel x/y/z + gyro) with leave-one-out accuracy reported per gesture.
 
 - **2026-10-05** — Voice is now recorded on-device via the onboard PDM mic instead of being uploaded over BLE, which removes the mid-upload disconnects entirely.
 
