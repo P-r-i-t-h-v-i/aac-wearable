@@ -110,6 +110,19 @@ BLEStringCharacteristic statusChar("a5e7c000-9c3f-4a4e-8e1e-1a2b3c4d5e02", BLERe
 #define REC_MAX_SAMPLES  20000      // 2.5s @ 8kHz
 #define REC_TIMEOUT_MS   4000
 
+// nRF52 PDM gain register: 0x00..0x50, 0.5dB per step, 0x28 = 0dB. The PDM
+// library's own default is 20 (-10dB), which is well below even the chip's
+// default and far below the 0x50 (+20dB) ceiling - a wristband mic sits a
+// good distance from the mouth, so run it near the top. Adjustable live with
+// "MG,<0-80>" if it ever distorts.
+// Measured on this board: at 0x4A (+17dB) quiet-room ambient alone already
+// peaked at ~14800, so close speech would have clipped the ADC. 0x28 (0dB)
+// puts ambient near ~2000 and leaves room for speech to approach full scale;
+// the loudness normalization below does the rest.
+#define PDM_GAIN_MAX     0x50
+int   g_micGain = 0x28;
+float REC_TARGET_RMS = 0.22f;       // tune with "MR,<0.05-0.5>"
+
 int16_t  g_recBuf[REC_MAX_SAMPLES];
 volatile uint32_t g_recCount = 0;
 volatile bool g_recording = false;
@@ -334,6 +347,13 @@ void handleCommand(String input) {
     if (slot >= 0 && slot < MSG_COUNT) playMessage(slot);
   } else if (sscanf(input.c_str(), "DEL,%d", &slot) == 1) {
     deleteMessage(slot);
+  } else if (sscanf(input.c_str(), "MG,%d", &slot) == 1) {
+    g_micGain = constrain(slot, 0, PDM_GAIN_MAX);
+    logStatus("[OK] Mic gain = " + String(g_micGain) +
+              " (" + String((g_micGain - 0x28) * 0.5f, 1) + "dB)");
+  } else if (sscanf(input.c_str(), "MR,%f", &f) == 1) {
+    REC_TARGET_RMS = constrain(f, 0.05f, 0.5f);
+    logStatus("[OK] Target loudness = " + String(REC_TARGET_RMS, 2));
   } else if (sscanf(input.c_str(), "GT,%f", &f) == 1) {
     g_gestureThreshold = f;
     logStatus("[OK] Gesture threshold = " + String(g_gestureThreshold, 2));
@@ -568,12 +588,21 @@ void startRecording(int slot) {
   calibrateBeep(1);              // beep = speak now
   digitalWrite(PIN_LED_BLUE, LOW);
 
+  // Let the speaker's beep die away before opening the mic.
+  delay(150);
+
+  PDM.setGain(g_micGain);
   if (!PDM.begin(1, 16000)) {
     logStatus("[ERROR] microphone failed to start");
     digitalWrite(PIN_LED_BLUE, HIGH);
     g_recSlot = -1;
     return;
   }
+
+  // The PDM decimation filter emits a full-scale transient while it settles.
+  // g_recording is still false here, so onPDMdata() drains and discards it;
+  // without this the clip starts clipped and normalization is thrown off.
+  delay(250);
 
   g_recStart = millis();
   g_recording = true;
@@ -592,19 +621,35 @@ void stopRecording() {
     return;
   }
 
-  // Peak-normalize so quiet speech still drives the amp properly.
+  // Normalize to a target loudness rather than just peak, so a single click
+  // can't leave the speech itself quiet. Peaks past the knee are rounded off
+  // smoothly - hard clipping a fricative turns it into a harsh burst.
   int32_t peak = 1;
   for (uint32_t i = 0; i < n; i++) {
     int32_t a = abs(g_recBuf[i]);
     if (a > peak) peak = a;
   }
-  float gain = 32000.0f / (float)peak;
-  if (gain > 20.0f) gain = 20.0f;
+  float toUnit = 1.0f / (float)peak;
+
+  double acc = 0;
   for (uint32_t i = 0; i < n; i++) {
-    int32_t v = (int32_t)(g_recBuf[i] * gain);
-    if (v > 32767) v = 32767;
-    if (v < -32768) v = -32768;
-    g_recBuf[i] = (int16_t)v;
+    float v = g_recBuf[i] * toUnit;
+    acc += (double)v * v;
+  }
+  float rms = sqrt(acc / (double)n);
+
+  float gain = (rms > 0.0001f) ? (REC_TARGET_RMS / rms) : 1.0f;
+  if (gain > 60.0f) gain = 60.0f;
+
+  const float knee = 0.5f;
+  for (uint32_t i = 0; i < n; i++) {
+    float v = g_recBuf[i] * toUnit * gain;
+    float a = fabsf(v);
+    if (a > knee) a = knee + (1.0f - knee) * tanhf((a - knee) / (1.0f - knee));
+    float out = (v < 0 ? -a : a) * 32000.0f;
+    if (out > 32767.0f) out = 32767.0f;
+    if (out < -32768.0f) out = -32768.0f;
+    g_recBuf[i] = (int16_t)out;
   }
 
   // Hand off to the incremental flash writer in loop().
@@ -612,7 +657,10 @@ void stopRecording() {
   g_flushOffset = 0;
   g_flushAddr = slotAddr(g_recSlot) + AUDIO_HEADER_BYTES;
 
-  logStatus(String("[REC] captured ") + String(n) + " samples, saving...");
+  // Raw levels, so a still-quiet recording can be diagnosed as mic-side
+  // (low peak) rather than normalization-side.
+  logStatus(String("[REC] captured ") + String(n) + " samples (raw peak " +
+            String(peak) + ", gain x" + String(gain, 1) + "), saving...");
 }
 
 void serviceFlush() {
